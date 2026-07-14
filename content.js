@@ -6,6 +6,7 @@
   const SIGNAL_EVALUATION_HORIZON_MS = 5 * 60 * 1000;
   const BACKTEST_STORAGE_KEY = "signalBacktests";
   const LATEST_SIGNAL_STORAGE_KEY = "latestSignalSnapshot";
+  const OVERLAY_POSITION_STORAGE_KEY = "signalOverlayPosition";
   const BACKTEST_MAX_RECORDS = 100;
   const OVERLAY_ID = "upstox-quant-signal-overlay";
   const SIGNAL_NOTIFICATION_TYPE = "UPSTOX_OPTION_SIGNAL";
@@ -262,10 +263,13 @@
       "letter-spacing:0",
       "pointer-events:none",
       "white-space:normal",
-      "overflow:visible"
+      "overflow:visible",
+      "cursor:default",
+      "user-select:none"
     ].join(";");
 
     overlay.innerHTML = [
+      '<button type="button" data-role="drag" title="Move signal overlay" style="position:absolute;top:-9px;right:-9px;width:18px;height:18px;border:0;border-radius:999px;background:#0891b2;color:#ffffff;box-shadow:0 2px 7px rgba(15,23,42,0.24);cursor:grab;padding:0;font-size:12px;line-height:18px;font-weight:900;pointer-events:auto;">•</button>',
       '<div data-role="stock" style="font-weight:800;font-size:11px;opacity:0.86;text-transform:uppercase;overflow-wrap:anywhere;"></div>',
       '<div data-role="signal" style="font-weight:900;font-size:15px;overflow-wrap:anywhere;"></div>',
       '<div data-role="meta" style="opacity:0.92;font-weight:700;overflow-wrap:anywhere;"></div>',
@@ -274,7 +278,101 @@
     ].join("");
 
     document.documentElement.appendChild(overlay);
+    restoreOverlayPosition(overlay);
+    enableOverlayDrag(overlay);
     return overlay;
+  }
+
+  function clampOverlayPosition(left, top, overlay) {
+    const margin = 8;
+    const width = overlay.offsetWidth || 300;
+    const height = overlay.offsetHeight || 120;
+    const maxLeft = Math.max(margin, window.innerWidth - width - margin);
+    const maxTop = Math.max(margin, window.innerHeight - height - margin);
+
+    return {
+      left: Math.min(Math.max(margin, left), maxLeft),
+      top: Math.min(Math.max(margin, top), maxTop)
+    };
+  }
+
+  function setOverlayPosition(overlay, position) {
+    const clamped = clampOverlayPosition(position.left, position.top, overlay);
+    overlay.style.left = `${clamped.left}px`;
+    overlay.style.top = `${clamped.top}px`;
+    overlay.style.right = "auto";
+    overlay.style.bottom = "auto";
+    return clamped;
+  }
+
+  function restoreOverlayPosition(overlay) {
+    const storage = globalThis.chrome?.storage?.local;
+    if (!storage) return;
+
+    storage.get(OVERLAY_POSITION_STORAGE_KEY, (items) => {
+      const position = items?.[OVERLAY_POSITION_STORAGE_KEY];
+      if (!position || !Number.isFinite(position.left) || !Number.isFinite(position.top)) return;
+      setOverlayPosition(overlay, position);
+    });
+  }
+
+  function saveOverlayPosition(position) {
+    const storage = globalThis.chrome?.storage?.local;
+    if (!storage) return;
+    storage.set({ [OVERLAY_POSITION_STORAGE_KEY]: position });
+  }
+
+  function enableOverlayDrag(overlay) {
+    const dragHandle = overlay.querySelector('[data-role="drag"]');
+    if (!dragHandle) return;
+
+    let dragState = null;
+
+    dragHandle.addEventListener("pointerdown", (event) => {
+      const rect = overlay.getBoundingClientRect();
+      dragState = {
+        pointerId: event.pointerId,
+        offsetX: event.clientX - rect.left,
+        offsetY: event.clientY - rect.top
+      };
+      dragHandle.setPointerCapture(event.pointerId);
+      dragHandle.style.cursor = "grabbing";
+      event.preventDefault();
+      event.stopPropagation();
+    });
+
+    dragHandle.addEventListener("pointermove", (event) => {
+      if (!dragState || event.pointerId !== dragState.pointerId) return;
+      setOverlayPosition(overlay, {
+        left: event.clientX - dragState.offsetX,
+        top: event.clientY - dragState.offsetY
+      });
+      event.preventDefault();
+    });
+
+    function endDrag(event) {
+      if (!dragState || event.pointerId !== dragState.pointerId) return;
+      const rect = overlay.getBoundingClientRect();
+      const position = setOverlayPosition(overlay, {
+        left: rect.left,
+        top: rect.top
+      });
+      saveOverlayPosition(position);
+      dragState = null;
+      dragHandle.style.cursor = "grab";
+    }
+
+    dragHandle.addEventListener("pointerup", endDrag);
+    dragHandle.addEventListener("pointercancel", endDrag);
+
+    window.addEventListener("resize", () => {
+      const rect = overlay.getBoundingClientRect();
+      const position = setOverlayPosition(overlay, {
+        left: rect.left,
+        top: rect.top
+      });
+      saveOverlayPosition(position);
+    });
   }
 
   function formatTime(timestamp) {
