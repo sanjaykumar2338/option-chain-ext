@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Upstox Option Signals</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="popup">
+      <header class="header">
+        <img src="icon-128.png" alt="" width="32" height="32">
+        <div>
+          <h1>Option Signals</h1>
+          <p>Upstox alert settings</p>
+        </div>
+      </header>
+
+      <label class="setting">
+        <span>
+          <strong>Buy signal notifications</strong>
+          <small>Chrome alerts for BUY CALL and BUY PUT</small>
+        </span>
+        <input id="notificationsToggle" type="checkbox" role="switch">
+      </label>
+
+      <p id="status" class="status" aria-live="polite"></p>
+
+      <section class="score-card" aria-labelledby="scoreTitle">
+        <div class="score-header">
+          <div>
+            <h2 id="scoreTitle">Current score</h2>
+            <p id="scoreStock">Open an option-chain page</p>
+          </div>
+          <strong id="scoreSignal" class="score-signal">--</strong>
+        </div>
+
+        <div class="score-grid">
+          <div>
+            <strong id="currentStrength">--</strong>
+            <small>Strength</small>
+          </div>
+          <div>
+            <strong id="currentScore">--</strong>
+            <small>Score</small>
+          </div>
+          <div>
+            <strong id="forecastConfidence">--</strong>
+            <small>Forecast</small>
+          </div>
+        </div>
+
+        <p id="scoreDetail" class="latest">Waiting for latest signal data.</p>
+      </section>
+
+      <section class="stats" aria-labelledby="statsTitle">
+        <div class="stats-header">
+          <div>
+            <h2 id="statsTitle">5-minute signal check</h2>
+            <p>Local hit/miss tracking</p>
+          </div>
+          <button id="clearBacktest" type="button">Clear</button>
+        </div>
+
+        <div class="stat-grid">
+          <div>
+            <strong id="hitRate">--</strong>
+            <small>Hit rate</small>
+          </div>
+          <div>
+            <strong id="closedSignals">0</strong>
+            <small>Checked</small>
+          </div>
+          <div>
+            <strong id="pendingSignals">0</strong>
+            <small>Pending</small>
+          </div>
+        </div>
+
+        <p id="latestSignal" class="latest">No checked signals yet.</p>
+      </section>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
