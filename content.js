@@ -2,6 +2,8 @@
   "use strict";
 
   const POLL_INTERVAL_MS = 10000;
+  const SIGNAL_REPEAT_NOTIFICATION_MS = 2 * 60 * 1000;
+  const SIGNAL_TOAST_MS = 8000;
   const MARKET_HISTORY_WINDOW_MS = 30 * 60 * 1000;
   const SIGNAL_EVALUATION_HORIZON_MS = 5 * 60 * 1000;
   const BACKTEST_STORAGE_KEY = "signalBacktests";
@@ -9,10 +11,17 @@
   const OVERLAY_POSITION_STORAGE_KEY = "signalOverlayPosition";
   const BACKTEST_MAX_RECORDS = 100;
   const OVERLAY_ID = "upstox-quant-signal-overlay";
+  const SIGNAL_TOAST_ID = "upstox-quant-signal-toast";
   const SIGNAL_NOTIFICATION_TYPE = "UPSTOX_OPTION_SIGNAL";
   const engine = new OptionSignalEngine();
   let marketHistory = [];
   let lastSignalKey = null;
+  let lastNotification = {
+    signalKey: null,
+    stockName: null,
+    timestamp: 0
+  };
+  let signalToastTimer = null;
 
   function parseNumber(value) {
     if (value == null) return NaN;
@@ -414,6 +423,55 @@
       `${result.signal.detail} | ${trendText} | ${formatForecastTrend(result.forecast)} | Updated: ${formatTime(result.marketState.timestamp)} | Refresh: 10s`;
   }
 
+  function showSignalToast(result, isRepeat) {
+    let toast = document.getElementById(SIGNAL_TOAST_ID);
+    if (!toast) {
+      toast = document.createElement("div");
+      toast.id = SIGNAL_TOAST_ID;
+      toast.style.cssText = [
+        "position:fixed",
+        "top:72px",
+        "left:50%",
+        "transform:translateX(-50%)",
+        "z-index:100000",
+        "display:flex",
+        "flex-direction:column",
+        "gap:4px",
+        "width:max-content",
+        "min-width:260px",
+        "max-width:min(460px, calc(100vw - 32px))",
+        "padding:11px 14px",
+        "border-radius:8px",
+        "box-shadow:0 12px 30px rgba(15,23,42,0.28)",
+        "color:#ffffff",
+        "font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",
+        "font-size:12px",
+        "line-height:1.25",
+        "letter-spacing:0",
+        "pointer-events:none",
+        "white-space:normal",
+        "overflow-wrap:anywhere"
+      ].join(";");
+      toast.innerHTML = [
+        '<div data-role="signal" style="font-weight:900;font-size:16px;"></div>',
+        '<div data-role="detail" style="font-weight:700;opacity:0.92;"></div>'
+      ].join("");
+      document.documentElement.appendChild(toast);
+    }
+
+    toast.style.background = result.signal.color;
+    toast.querySelector('[data-role="signal"]').innerText =
+      `${isRepeat ? "STILL ACTIVE: " : ""}${result.signal.label}`;
+    toast.querySelector('[data-role="detail"]').innerText =
+      `${result.marketState.stockName} | Strength ${result.strength}/100 | ${result.forecast.label}`;
+    toast.style.display = "flex";
+
+    window.clearTimeout(signalToastTimer);
+    signalToastTimer = window.setTimeout(() => {
+      toast.style.display = "none";
+    }, SIGNAL_TOAST_MS);
+  }
+
   function saveLatestSignalSnapshot(result) {
     const storage = globalThis.chrome?.storage?.local;
     if (!storage) return;
@@ -548,6 +606,11 @@
       stockName: result.marketState.stockName,
       detail: `${result.signal.detail}. Strength ${result.strength}/100. ${result.forecast.label} ${result.forecast.confidence}/100. ${trendText}.`,
       meta: result.marketState.indexName
+    }, () => {
+      const lastError = chrome.runtime.lastError;
+      if (lastError) {
+        console.warn("[Upstox Quant Signal] Notification send failed", lastError.message);
+      }
     });
   }
 
@@ -555,9 +618,26 @@
     const signalChanged = result.signal.key !== lastSignalKey;
     lastSignalKey = result.signal.key;
 
-    if (!isBuySignal(result) || !signalChanged) return;
+    if (!isBuySignal(result)) return;
 
-    recordSignalBacktest(result);
+    const notificationChanged =
+      result.signal.key !== lastNotification.signalKey ||
+      result.marketState.stockName !== lastNotification.stockName;
+    const notificationStale =
+      result.marketState.timestamp - lastNotification.timestamp >= SIGNAL_REPEAT_NOTIFICATION_MS;
+
+    if (!signalChanged && !notificationChanged && !notificationStale) return;
+
+    if (signalChanged) {
+      recordSignalBacktest(result);
+    }
+
+    lastNotification = {
+      signalKey: result.signal.key,
+      stockName: result.marketState.stockName,
+      timestamp: result.marketState.timestamp
+    };
+    showSignalToast(result, !signalChanged);
     sendSignalNotification(result);
   }
 

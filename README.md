@@ -6,7 +6,7 @@ Chrome Extension MV3 for `https://pro.upstox.com/option-chain/*`.
 
 - `manifest.json` registers the content scripts.
 - `OptionSignalEngine.js` contains the trend-aware score engine.
-- `content.js` scrapes the Upstox DOM every 10 seconds, keeps 30 minutes of local history, updates one fixed overlay, saves the latest score for the popup, and records 5-minute signal outcomes.
+- `content.js` scrapes the Upstox DOM every 10 seconds, keeps 30 minutes of local history, updates one fixed overlay, shows in-page buy-signal alerts, saves the latest score for the popup, and records 5-minute signal outcomes.
 - `background.js` sends Chrome notifications when the signal changes to `BUY CALL` or `BUY PUT`.
 - `popup.html`, `popup.css`, and `popup.js` provide the extension popup notification setting.
 - `icon-128.png` is used for the extension and notification icon.
@@ -47,6 +47,6 @@ The popup shows the latest signal score, strength, forecast confidence, hit rate
 
 The overlay refreshes every 10 seconds and shows the option-chain stock/index name, derived index label, `BUY CALL`, `BUY PUT`, or `NEUTRAL / WAIT`, signal strength, 10-20 minute forecast, 5/10/15-minute spot trend, update time, and refresh interval.
 
-Chrome also sends a desktop notification when the signal enters or changes to `BUY CALL` or `BUY PUT`. It does not repeat the same buy notification on every refresh, but it will alert again if the signal returns after a neutral/wait period.
+Chrome also sends a desktop notification when the signal enters or changes to `BUY CALL` or `BUY PUT`. If the same buy signal stays active, the extension repeats the alert every 2 minutes and also shows an in-page signal toast for 8 seconds.
 
 Use the extension toolbar popup to turn buy signal notifications on or off.
