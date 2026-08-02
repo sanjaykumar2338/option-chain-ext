@@ -19,7 +19,7 @@
   const clearBacktest = document.getElementById("clearBacktest");
 
   function setStatus(enabled) {
-    status.innerText = enabled ? "Notifications are on." : "Notifications are off.";
+    status.innerText = enabled ? "Chrome notifications are on." : "Chrome notifications are off.";
   }
 
   chrome.storage.sync.get({ [NOTIFICATIONS_ENABLED_KEY]: true }, (settings) => {

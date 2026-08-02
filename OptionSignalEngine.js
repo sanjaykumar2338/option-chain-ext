@@ -1,19 +1,37 @@
 (function exposeOptionSignalEngine(global) {
   "use strict";
 
+  /**
+   * @typedef {{ltp:number,ltpChangePct:number,oiChg:number,oiChgPct:number,volume:number,iv:number,delta:number,gamma:number,vega:number,oi?:number}} OptionSide
+   * @typedef {{strike:number,call:OptionSide,put:OptionSide}} OptionStrike
+   * @typedef {{stockName?:string,spotPrice:number,maxPain:number,indiaVix:number,timestamp:number,strikes:OptionStrike[]}} MarketState
+   */
+
   const TREND_LOOKBACK_MS = 5 * 60 * 1000;
   const MIN_TREND_AGE_MS = 60 * 1000;
   const FORECAST_LOOKBACKS_MS = [5, 10, 15].map((minutes) => minutes * 60 * 1000);
+  const OI_VELOCITY_WINDOW_MS = 3 * 60 * 1000;
+  const OI_VELOCITY_LOOKBACKS_MS = [60 * 1000, 3 * 60 * 1000];
 
   class OptionSignalEngine {
+    constructor() {
+      this.oiHistoryByMarket = new Map();
+    }
+
+    /**
+     * @param {MarketState} marketState
+     * @param {MarketState[]} history
+     */
     analyze(marketState, history = []) {
       const normalizedMarketState = this.normalizeMarketState(marketState);
       const normalizedHistory = this.normalizeHistory(history);
       const trend = this.calculateTrend(normalizedMarketState, normalizedHistory);
       const directionalBuildUp = this.scoreDirectionalBuildUp(normalizedMarketState);
+      const oiVelocity = this.scoreOiVelocity(normalizedMarketState);
 
       const factors = {
         directionalBuildUp,
+        oiVelocity,
         pcrContext: this.scorePcrContext(normalizedMarketState, trend),
         spotTrend: this.scoreSpotTrend(trend),
         spotConfirmation: this.scoreSpotConfirmation(directionalBuildUp, trend),
@@ -37,7 +55,7 @@
         trend
       );
 
-      return {
+      const result = {
         totalScore,
         strength: Math.abs(totalScore),
         signal,
@@ -46,8 +64,15 @@
         trend,
         marketState: normalizedMarketState
       };
+
+      this.rememberOiSnapshot(normalizedMarketState);
+      return result;
     }
 
+    /**
+     * @param {Partial<MarketState>} marketState
+     * @returns {MarketState}
+     */
     normalizeMarketState(marketState = {}) {
       return {
         ...marketState,
@@ -80,7 +105,8 @@
         iv: this.toFiniteNumber(side.iv),
         delta: this.toFiniteNumber(side.delta),
         gamma: this.toFiniteNumber(side.gamma),
-        vega: this.toFiniteNumber(side.vega)
+        vega: this.toFiniteNumber(side.vega),
+        oi: this.toFiniteNumber(side.oi, NaN)
       };
     }
 
@@ -196,11 +222,9 @@
       if (!marketState.strikes.length) return 0;
 
       const strikeStep = this.estimateStrikeStep(marketState.strikes);
+      const sigma = Math.max(strikeStep * 3, 1);
       const scoredRows = marketState.strikes.map((row) => {
-        const distance = Number.isFinite(marketState.spotPrice)
-          ? Math.abs(row.strike - marketState.spotPrice)
-          : 0;
-        const distanceWeight = 1 / (1 + distance / Math.max(strikeStep, 1));
+        const atmWeight = this.calculateGaussianAtmWeight(row.strike, marketState.spotPrice, sigma);
         const activityWeight = Math.log1p(
           Math.abs(row.call.oiChg) +
           Math.abs(row.put.oiChg) +
@@ -210,7 +234,7 @@
 
         return {
           score: this.scoreSideBuildUp("call", row.call) + this.scoreSideBuildUp("put", row.put),
-          weight: Math.max(activityWeight, 1) * distanceWeight
+          weight: Math.max(activityWeight, 1) * atmWeight
         };
       });
 
@@ -297,6 +321,116 @@
       if (bullishBuildUp && spotFalling) return -10;
       if (bearishBuildUp && spotRising) return 10;
       return 0;
+    }
+
+    calculateGaussianAtmWeight(strike, spotPrice, sigma) {
+      if (!Number.isFinite(strike) || !Number.isFinite(spotPrice) || !Number.isFinite(sigma) || sigma <= 0) {
+        return 1;
+      }
+
+      const distance = strike - spotPrice;
+      return Math.exp(-(distance * distance) / (2 * sigma * sigma));
+    }
+
+    rememberOiSnapshot(marketState) {
+      const marketKey = marketState.stockName || "Option Chain";
+      const cutoff = marketState.timestamp - OI_VELOCITY_WINDOW_MS;
+      const snapshots = (this.oiHistoryByMarket.get(marketKey) || [])
+        .filter((snapshot) => snapshot.timestamp >= cutoff);
+
+      snapshots.push({
+        timestamp: marketState.timestamp,
+        strikes: new Map(marketState.strikes.map((row) => [
+          row.strike,
+          {
+            callOi: Number.isFinite(row.call.oi) ? row.call.oi : NaN,
+            putOi: Number.isFinite(row.put.oi) ? row.put.oi : NaN
+          }
+        ]))
+      });
+
+      this.oiHistoryByMarket.set(marketKey, snapshots);
+    }
+
+    getOiLookbackSnapshot(marketState, lookbackMs) {
+      const marketKey = marketState.stockName || "Option Chain";
+      const snapshots = this.oiHistoryByMarket.get(marketKey) || [];
+      const eligible = snapshots.filter((snapshot) => {
+        const ageMs = marketState.timestamp - snapshot.timestamp;
+        return ageMs >= MIN_TREND_AGE_MS && ageMs <= lookbackMs;
+      });
+
+      if (!eligible.length) return null;
+
+      return eligible.reduce((best, snapshot) => {
+        const bestDistance = Math.abs(marketState.timestamp - best.timestamp - lookbackMs);
+        const snapshotDistance = Math.abs(marketState.timestamp - snapshot.timestamp - lookbackMs);
+        return snapshotDistance < bestDistance ? snapshot : best;
+      });
+    }
+
+    scoreOiVelocity(marketState) {
+      if (!marketState.strikes.length) return 0;
+
+      const lookbackSnapshots = OI_VELOCITY_LOOKBACKS_MS
+        .map((lookbackMs) => ({
+          lookbackMs,
+          snapshot: this.getOiLookbackSnapshot(marketState, lookbackMs)
+        }))
+        .filter((entry) => entry.snapshot);
+
+      if (!lookbackSnapshots.length) return 0;
+
+      const strikeStep = this.estimateStrikeStep(marketState.strikes);
+      const sigma = Math.max(strikeStep * 3, 1);
+      const weightedScores = marketState.strikes.map((row) => {
+        const atmWeight = this.calculateGaussianAtmWeight(row.strike, marketState.spotPrice, sigma);
+        const rowScore = lookbackSnapshots.reduce((sum, entry) => {
+          const previous = entry.snapshot.strikes.get(row.strike);
+          if (!previous) return sum;
+
+          const minutes = entry.lookbackMs / 60000;
+          const callVelocity = this.calculateSideOiVelocity(row.call.oi, previous.callOi, minutes);
+          const putVelocity = this.calculateSideOiVelocity(row.put.oi, previous.putOi, minutes);
+          const callScore = this.scoreVelocitySide("call", row.call, callVelocity);
+          const putScore = this.scoreVelocitySide("put", row.put, putVelocity);
+          return sum + ((callScore + putScore) / lookbackSnapshots.length);
+        }, 0);
+
+        return {
+          score: rowScore,
+          weight: atmWeight
+        };
+      });
+
+      const totalWeight = weightedScores.reduce((sum, row) => sum + row.weight, 0);
+      if (!totalWeight) return 0;
+
+      const weightedScore = weightedScores.reduce((sum, row) => {
+        return sum + row.score * row.weight;
+      }, 0) / totalWeight;
+
+      return this.clamp(weightedScore, -18, 18);
+    }
+
+    calculateSideOiVelocity(currentOi, previousOi, minutes) {
+      if (!Number.isFinite(currentOi) || !Number.isFinite(previousOi) || minutes <= 0) return 0;
+      return (currentOi - previousOi) / minutes;
+    }
+
+    scoreVelocitySide(sideName, side, velocityPerMinute) {
+      if (!Number.isFinite(velocityPerMinute) || velocityPerMinute <= 0) return 0;
+
+      const baseOi = Number.isFinite(side.oi) && side.oi > 0 ? side.oi : Math.abs(side.oiChg);
+      const relativeVelocity = baseOi > 0 ? (velocityPerMinute / baseOi) * 100 : 0;
+      const intensity = this.clamp(Math.log1p(Math.max(relativeVelocity, 0)) * 4, 0, 9);
+      const priceDirection = Math.sign(side.ltpChangePct);
+
+      if (sideName === "call") {
+        return priceDirection >= 0 ? intensity : -intensity * 0.75;
+      }
+
+      return priceDirection >= 0 ? -intensity : intensity * 0.75;
     }
 
     calculateForecast(totalScore, directionalBuildUp, marketState, history, trend) {

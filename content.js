@@ -1,7 +1,14 @@
 (function runUpstoxOptionChainSignal() {
   "use strict";
 
-  const POLL_INTERVAL_MS = 10000;
+  /**
+   * @typedef {{ltp:number,ltpChangePct:number,oiChg:number,oiChgPct:number,volume:number,iv:number,delta:number,gamma:number,vega:number,oi?:number}} OptionSide
+   * @typedef {{strike:number,call:OptionSide,put:OptionSide}} OptionStrike
+   * @typedef {{stockName:string,indexName:string,spotPrice:number,maxPain:number,indiaVix:number,timestamp:number,strikes:OptionStrike[],source?:string}} MarketState
+   */
+
+  const NETWORK_EVENT_NAME = "upstox-option-chain-network-payload";
+  const FALLBACK_DEBOUNCE_MS = 700;
   const SIGNAL_REPEAT_NOTIFICATION_MS = 2 * 60 * 1000;
   const SIGNAL_TOAST_MS = 8000;
   const MARKET_HISTORY_WINDOW_MS = 30 * 60 * 1000;
@@ -21,6 +28,7 @@
     stockName: null,
     timestamp: 0
   };
+  let fallbackTimer = null;
   let signalToastTimer = null;
 
   function parseNumber(value) {
@@ -48,6 +56,227 @@
 
   function safeNumber(value, fallback = 0) {
     return Number.isFinite(value) ? value : fallback;
+  }
+
+  function isPlainObject(value) {
+    return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+  }
+
+  function firstFiniteValue(source, keys, fallback = NaN) {
+    if (!isPlainObject(source)) return fallback;
+
+    for (const key of keys) {
+      const directValue = source[key];
+      const numericValue = typeof directValue === "number" ? directValue : parseNumber(directValue);
+      if (Number.isFinite(numericValue)) return numericValue;
+
+      const matchedKey = Object.keys(source).find((candidate) => {
+        return candidate.toLowerCase() === key.toLowerCase();
+      });
+      if (!matchedKey) continue;
+
+      const matchedValue = source[matchedKey];
+      const matchedNumericValue = typeof matchedValue === "number"
+        ? matchedValue
+        : parseNumber(matchedValue);
+      if (Number.isFinite(matchedNumericValue)) return matchedNumericValue;
+    }
+
+    return fallback;
+  }
+
+  function firstTextValue(source, keys, fallback = "") {
+    if (!isPlainObject(source)) return fallback;
+
+    for (const key of keys) {
+      const directValue = source[key];
+      if (typeof directValue === "string" && directValue.trim()) return directValue.trim();
+
+      const matchedKey = Object.keys(source).find((candidate) => {
+        return candidate.toLowerCase() === key.toLowerCase();
+      });
+      const matchedValue = matchedKey ? source[matchedKey] : null;
+      if (typeof matchedValue === "string" && matchedValue.trim()) return matchedValue.trim();
+    }
+
+    return fallback;
+  }
+
+  function normalizeNetworkSide(source) {
+    return {
+      ltp: safeNumber(firstFiniteValue(source, ["ltp", "lastPrice", "last_price", "lastTradedPrice"])),
+      ltpChangePct: safeNumber(firstFiniteValue(source, [
+        "ltpChangePct",
+        "ltp_change_pct",
+        "changePercent",
+        "change_percentage",
+        "priceChangePercent",
+        "pChange"
+      ])),
+      oiChg: safeNumber(firstFiniteValue(source, [
+        "oiChg",
+        "oi_change",
+        "openInterestChange",
+        "changeInOpenInterest",
+        "oiChange"
+      ])),
+      oiChgPct: safeNumber(firstFiniteValue(source, [
+        "oiChgPct",
+        "oi_change_pct",
+        "openInterestChangePercent",
+        "oiChangePercent"
+      ])),
+      volume: safeNumber(firstFiniteValue(source, ["volume", "tradedVolume", "totalTradedVolume"])),
+      iv: safeNumber(firstFiniteValue(source, ["iv", "impliedVolatility", "implied_volatility"])),
+      delta: safeNumber(firstFiniteValue(source, ["delta"])),
+      gamma: safeNumber(firstFiniteValue(source, ["gamma"])),
+      vega: safeNumber(firstFiniteValue(source, ["vega"])),
+      oi: safeNumber(firstFiniteValue(source, ["oi", "openInterest", "open_interest"]), NaN)
+    };
+  }
+
+  function mergeSide(primary, fallback) {
+    const merged = { ...primary };
+    Object.keys(fallback || {}).forEach((key) => {
+      if (Number.isFinite(fallback[key]) && (!Number.isFinite(merged[key]) || merged[key] === 0)) {
+        merged[key] = fallback[key];
+      }
+    });
+    return merged;
+  }
+
+  function findOptionSideContainer(row, side) {
+    if (!isPlainObject(row)) return null;
+
+    const aliases = side === "call"
+      ? ["call", "ce", "CE", "Call", "CALL", "callOption", "callData"]
+      : ["put", "pe", "PE", "Put", "PUT", "putOption", "putData"];
+
+    for (const key of aliases) {
+      if (isPlainObject(row[key])) return row[key];
+    }
+
+    return null;
+  }
+
+  function normalizeNetworkStrike(row) {
+    if (!isPlainObject(row)) return null;
+
+    const strike = firstFiniteValue(row, [
+      "strike",
+      "strikePrice",
+      "strike_price",
+      "sp",
+      "strike_price_value"
+    ]);
+    if (!Number.isFinite(strike)) return null;
+
+    const optionType = firstTextValue(row, ["optionType", "option_type", "instrumentType", "type"])
+      .toLowerCase();
+    const callContainer = findOptionSideContainer(row, "call");
+    const putContainer = findOptionSideContainer(row, "put");
+
+    if (callContainer || putContainer) {
+      return {
+        strike,
+        call: normalizeNetworkSide(callContainer || {}),
+        put: normalizeNetworkSide(putContainer || {})
+      };
+    }
+
+    if (optionType.includes("ce") || optionType.includes("call")) {
+      return { strike, call: normalizeNetworkSide(row), put: normalizeNetworkSide({}) };
+    }
+
+    if (optionType.includes("pe") || optionType.includes("put")) {
+      return { strike, call: normalizeNetworkSide({}), put: normalizeNetworkSide(row) };
+    }
+
+    return null;
+  }
+
+  function collectNetworkStrikes(payload, collected = []) {
+    if (Array.isArray(payload)) {
+      const normalizedRows = payload.map(normalizeNetworkStrike).filter(Boolean);
+      if (normalizedRows.length >= 2) collected.push(...normalizedRows);
+      payload.forEach((item) => collectNetworkStrikes(item, collected));
+      return collected;
+    }
+
+    if (!isPlainObject(payload)) return collected;
+
+    const normalizedRow = normalizeNetworkStrike(payload);
+    if (normalizedRow) collected.push(normalizedRow);
+
+    Object.values(payload).forEach((value) => {
+      if (value && typeof value === "object") collectNetworkStrikes(value, collected);
+    });
+
+    return collected;
+  }
+
+  function groupNetworkStrikes(rows) {
+    const rowsByStrike = new Map();
+
+    rows.forEach((row) => {
+      const existing = rowsByStrike.get(row.strike) || {
+        strike: row.strike,
+        call: normalizeNetworkSide({}),
+        put: normalizeNetworkSide({})
+      };
+
+      rowsByStrike.set(row.strike, {
+        strike: row.strike,
+        call: mergeSide(existing.call, row.call),
+        put: mergeSide(existing.put, row.put)
+      });
+    });
+
+    return Array.from(rowsByStrike.values()).sort((a, b) => a.strike - b.strike);
+  }
+
+  function findFirstNumberDeep(payload, keys, maxDepth = 5) {
+    if (maxDepth < 0 || payload == null) return NaN;
+    if (isPlainObject(payload)) {
+      const directValue = firstFiniteValue(payload, keys);
+      if (Number.isFinite(directValue)) return directValue;
+
+      for (const value of Object.values(payload)) {
+        const nestedValue = findFirstNumberDeep(value, keys, maxDepth - 1);
+        if (Number.isFinite(nestedValue)) return nestedValue;
+      }
+    }
+
+    if (Array.isArray(payload)) {
+      for (const item of payload) {
+        const nestedValue = findFirstNumberDeep(item, keys, maxDepth - 1);
+        if (Number.isFinite(nestedValue)) return nestedValue;
+      }
+    }
+
+    return NaN;
+  }
+
+  function findFirstTextDeep(payload, keys, maxDepth = 5) {
+    if (maxDepth < 0 || payload == null) return "";
+    if (isPlainObject(payload)) {
+      const directValue = firstTextValue(payload, keys);
+      if (directValue) return directValue;
+
+      for (const value of Object.values(payload)) {
+        const nestedValue = findFirstTextDeep(value, keys, maxDepth - 1);
+        if (nestedValue) return nestedValue;
+      }
+    }
+
+    if (Array.isArray(payload)) {
+      for (const item of payload) {
+        const nestedValue = findFirstTextDeep(item, keys, maxDepth - 1);
+        if (nestedValue) return nestedValue;
+      }
+    }
+
+    return "";
   }
 
   function getCellTexts(row) {
@@ -233,6 +462,44 @@
     };
   }
 
+  function parseNetworkMarketState(detail) {
+    const payload = detail?.payload;
+    const allStrikes = groupNetworkStrikes(collectNetworkStrikes(payload));
+    if (!allStrikes.length) return null;
+
+    const fallbackState = scrapeMarketState();
+    const payloadSpot = findFirstNumberDeep(payload, [
+      "spotPrice",
+      "spot_price",
+      "underlyingValue",
+      "underlying_value",
+      "indexValue",
+      "lastPrice"
+    ]);
+    const spotPrice = Number.isFinite(payloadSpot) ? payloadSpot : fallbackState.spotPrice;
+    const stockName = cleanStockName(findFirstTextDeep(payload, [
+      "symbol",
+      "tradingSymbol",
+      "trading_symbol",
+      "underlyingSymbol",
+      "underlying",
+      "name"
+    ])) || fallbackState.stockName;
+    const maxPain = findFirstNumberDeep(payload, ["maxPain", "max_pain"]);
+    const indiaVix = findFirstNumberDeep(payload, ["indiaVix", "india_vix", "vix"]);
+
+    return {
+      stockName,
+      indexName: getIndexName(stockName),
+      spotPrice,
+      maxPain: Number.isFinite(maxPain) ? maxPain : scrapeMaxPain(allStrikes, spotPrice),
+      indiaVix: Number.isFinite(indiaVix) ? indiaVix : fallbackState.indiaVix,
+      timestamp: Number.isFinite(detail?.timestamp) ? detail.timestamp : Date.now(),
+      strikes: getActiveStrikes(allStrikes, spotPrice),
+      source: detail?.source || "network"
+    };
+  }
+
   function getHistoryForMarket(marketState) {
     return marketHistory.filter((state) => state.stockName === marketState.stockName);
   }
@@ -407,6 +674,58 @@
     return `${minutes}m Spot: ${formatSignedPercent(longestTrend.spotChangePct)}`;
   }
 
+  function getAtmStrike(marketState) {
+    if (!marketState.strikes.length || !Number.isFinite(marketState.spotPrice)) return null;
+
+    return marketState.strikes.reduce((nearest, row) => {
+      return Math.abs(row.strike - marketState.spotPrice) <
+        Math.abs(nearest.strike - marketState.spotPrice)
+        ? row
+        : nearest;
+    }, marketState.strikes[0]);
+  }
+
+  function getRiskMatrix(result) {
+    const atmStrike = getAtmStrike(result.marketState);
+    const side = result.signal.key === "call"
+      ? atmStrike?.call
+      : result.signal.key === "put"
+        ? atmStrike?.put
+        : null;
+    const entryPrice = side?.ltp;
+
+    if (!Number.isFinite(entryPrice) || entryPrice <= 0) {
+      return {
+        action: result.signal.label,
+        strike: atmStrike?.strike,
+        entryPrice: NaN,
+        stopLoss: NaN,
+        target: NaN
+      };
+    }
+
+    return {
+      action: result.signal.label,
+      strike: atmStrike.strike,
+      entryPrice,
+      stopLoss: Math.max(0, entryPrice - 20),
+      target: entryPrice + 100
+    };
+  }
+
+  function formatPrice(value) {
+    return Number.isFinite(value) ? value.toFixed(2) : "--";
+  }
+
+  function formatRiskMatrix(result) {
+    const risk = getRiskMatrix(result);
+    if (!["call", "put"].includes(result.signal.key)) {
+      return `Action: ${risk.action} | Entry: -- | SL: -- | Target: --`;
+    }
+
+    return `Action: ${risk.action} ${risk.strike || ""} | Entry: ${formatPrice(risk.entryPrice)} | SL: ${formatPrice(risk.stopLoss)} | Target: ${formatPrice(risk.target)}`;
+  }
+
   function updateOverlay(result) {
     const overlay = createOverlay();
     overlay.style.background = result.signal.color;
@@ -420,7 +739,7 @@
     overlay.querySelector('[data-role="forecast"]').innerText =
       `${result.forecast.label} | Confidence ${result.forecast.confidence}/100`;
     overlay.querySelector('[data-role="detail"]').innerText =
-      `${result.signal.detail} | ${trendText} | ${formatForecastTrend(result.forecast)} | Updated: ${formatTime(result.marketState.timestamp)} | Refresh: 10s`;
+      `${result.signal.detail} | ${formatRiskMatrix(result)} | ${trendText} | ${formatForecastTrend(result.forecast)} | Updated: ${formatTime(result.marketState.timestamp)} | Source: ${result.marketState.source || "dom"}`;
   }
 
   function showSignalToast(result, isRepeat) {
@@ -472,10 +791,45 @@
     }, SIGNAL_TOAST_MS);
   }
 
+  function playSignalAudioCue(signalKey) {
+    const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextCtor) return;
+
+    try {
+      const audioContext = new AudioContextCtor();
+      const frequencies = signalKey === "call" ? [660, 880] : [440, 330];
+      const startedAt = audioContext.currentTime;
+
+      frequencies.forEach((frequency, index) => {
+        const oscillator = audioContext.createOscillator();
+        const gain = audioContext.createGain();
+        const start = startedAt + index * 0.13;
+        const stop = start + 0.11;
+
+        oscillator.type = "sine";
+        oscillator.frequency.setValueAtTime(frequency, start);
+        gain.gain.setValueAtTime(0.0001, start);
+        gain.gain.exponentialRampToValueAtTime(0.18, start + 0.015);
+        gain.gain.exponentialRampToValueAtTime(0.0001, stop);
+        oscillator.connect(gain);
+        gain.connect(audioContext.destination);
+        oscillator.start(start);
+        oscillator.stop(stop);
+      });
+
+      window.setTimeout(() => {
+        audioContext.close().catch(() => {});
+      }, 500);
+    } catch (error) {
+      console.warn("[Upstox Quant Signal] Audio cue failed", error);
+    }
+  }
+
   function saveLatestSignalSnapshot(result) {
     const storage = globalThis.chrome?.storage?.local;
     if (!storage) return;
 
+    const risk = getRiskMatrix(result);
     storage.set({
       [LATEST_SIGNAL_STORAGE_KEY]: {
         stockName: result.marketState.stockName,
@@ -489,6 +843,7 @@
         forecastConfidence: result.forecast.confidence,
         forecastScore: result.forecast.score,
         spotPrice: result.marketState.spotPrice,
+        risk,
         spotChangePct5m: result.trend.spotChangePct,
         hasTrendHistory: result.trend.hasEnoughHistory,
         updatedAt: result.marketState.timestamp
@@ -615,7 +970,8 @@
   }
 
   function handleSignalTransition(result) {
-    const signalChanged = result.signal.key !== lastSignalKey;
+    const previousSignalKey = lastSignalKey;
+    const signalChanged = result.signal.key !== previousSignalKey;
     lastSignalKey = result.signal.key;
 
     if (!isBuySignal(result)) return;
@@ -630,6 +986,7 @@
 
     if (signalChanged) {
       recordSignalBacktest(result);
+      playSignalAudioCue(result.signal.key);
     }
 
     lastNotification = {
@@ -651,9 +1008,8 @@
     overlay.querySelector('[data-role="detail"]').innerText = message;
   }
 
-  function runQuantitativeCycle() {
+  function processMarketState(marketState) {
     try {
-      const marketState = scrapeMarketState();
       if (!marketState.strikes.length) {
         updateOverlayError("Option-chain rows not ready", marketState.stockName);
         return;
@@ -672,6 +1028,54 @@
     }
   }
 
-  runQuantitativeCycle();
-  window.setInterval(runQuantitativeCycle, POLL_INTERVAL_MS);
+  function runFallbackDomCycle() {
+    processMarketState(scrapeMarketState());
+  }
+
+  function scheduleFallbackDomCycle() {
+    window.clearTimeout(fallbackTimer);
+    fallbackTimer = window.setTimeout(runFallbackDomCycle, FALLBACK_DEBOUNCE_MS);
+  }
+
+  function handleNetworkPayload(event) {
+    try {
+      const marketState = parseNetworkMarketState(event.detail);
+      if (!marketState?.strikes.length) return;
+      processMarketState(marketState);
+    } catch (error) {
+      console.warn("[Upstox Quant Signal] Network payload ignored", error);
+      scheduleFallbackDomCycle();
+    }
+  }
+
+  function installDomFallbackObserver() {
+    const observer = new MutationObserver((mutations) => {
+      const hasOptionChainMutation = mutations.some((mutation) => {
+        const targetElement = mutation.target?.nodeType === Node.ELEMENT_NODE
+          ? mutation.target
+          : mutation.target?.parentElement;
+        if (targetElement?.closest?.('tr[data-id^="leftTableOCRow"],tr[data-id^="rightTableOCRow"]')) {
+          return true;
+        }
+
+        return Array.from(mutation.addedNodes).some((node) => {
+          return node.nodeType === Node.ELEMENT_NODE &&
+            (node.matches?.('tr[data-id^="leftTableOCRow"],tr[data-id^="rightTableOCRow"]') ||
+              node.querySelector?.('tr[data-id^="leftTableOCRow"],tr[data-id^="rightTableOCRow"]'));
+        });
+      });
+
+      if (hasOptionChainMutation) scheduleFallbackDomCycle();
+    });
+
+    observer.observe(document.documentElement, {
+      childList: true,
+      characterData: true,
+      subtree: true
+    });
+  }
+
+  window.addEventListener(NETWORK_EVENT_NAME, handleNetworkPayload);
+  installDomFallbackObserver();
+  runFallbackDomCycle();
 })();

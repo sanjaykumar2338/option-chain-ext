@@ -20,6 +20,12 @@
   "content_scripts": [
     {
       "matches": ["https://pro.upstox.com/option-chain/*"],
+      "js": ["networkInterceptor.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://pro.upstox.com/option-chain/*"],
       "js": ["OptionSignalEngine.js", "content.js"],
       "run_at": "document_idle"
     }
