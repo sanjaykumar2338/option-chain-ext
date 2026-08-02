@@ -69,11 +69,30 @@
     }
 
     Object.setPrototypeOf(InterceptedWebSocket, NativeWebSocket);
-    InterceptedWebSocket.prototype = NativeWebSocket.prototype;
+    InterceptedWebSocket.prototype = Object.create(NativeWebSocket.prototype, {
+      constructor: {
+        value: InterceptedWebSocket,
+        writable: true,
+        configurable: true
+      }
+    });
+
+    ["CONNECTING", "OPEN", "CLOSING", "CLOSED"].forEach((prop) => {
+      Object.defineProperty(InterceptedWebSocket, prop, {
+        value: NativeWebSocket[prop],
+        writable: false,
+        enumerable: true,
+        configurable: true
+      });
+
+      Object.defineProperty(InterceptedWebSocket.prototype, prop, {
+        value: NativeWebSocket[prop],
+        writable: false,
+        enumerable: true,
+        configurable: true
+      });
+    });
+
     window.WebSocket = InterceptedWebSocket;
-    window.WebSocket.CONNECTING = NativeWebSocket.CONNECTING;
-    window.WebSocket.OPEN = NativeWebSocket.OPEN;
-    window.WebSocket.CLOSING = NativeWebSocket.CLOSING;
-    window.WebSocket.CLOSED = NativeWebSocket.CLOSED;
   }
 })();
