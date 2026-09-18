@@ -867,6 +867,8 @@
         totalScore: result.totalScore,
         strength: result.strength,
         forecastLabel: result.forecast.label,
+        forecastKey: result.forecast.key,
+        forecastDetail: result.forecast.detail,
         forecastConfidence: result.forecast.confidence,
         forecastScore: result.forecast.score,
         spotPrice: result.marketState.spotPrice,
@@ -995,7 +997,7 @@
       signalKey: result.signal.key,
       signalLabel: result.signal.label,
       stockName: result.marketState.stockName,
-      detail: `${result.signal.detail}. Strength ${result.strength}/100. ${result.forecast.label} ${result.forecast.confidence}/100. ${trendText}.`,
+      detail: `${result.signal.detail}. Strength ${result.strength}/100. ${result.forecast.label}${result.forecast.key === "warming" ? "" : ` ${result.forecast.confidence}/100`}. ${trendText}.`,
       meta: result.marketState.indexName
     }, (response) => {
       const lastError = chrome.runtime.lastError;

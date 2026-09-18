@@ -46,3 +46,17 @@ test('opening without a saved snapshot remains a waiting state', () => {
   const app = harness(null); app.advance(60000);
   assert.equal(app.text('scoreSignal'), '--');
 });
+
+test('early BUY with no forecast history says Collecting instead of zero', () => {
+  const app = harness({ ...buy, forecastKey: 'warming', forecastLabel: '10-20m Forecast Warming Up', forecastDetail: 'Collecting price history', forecastConfidence: 0 });
+  assert.equal(app.text('scoreSignal'), 'BUY CALL');
+  assert.equal(app.text('forecastConfidence'), 'Collecting');
+  assert.match(app.text('scoreDetail'), /Collecting price history/);
+});
+test('old warming snapshots are recognized; a ready zero forecast remains zero', () => {
+  const app = harness({ ...buy, forecastLabel: '10-20m Forecast Warming Up', forecastConfidence: 0 });
+  assert.equal(app.text('forecastConfidence'), 'Collecting');
+  app.update({ ...buy, forecastKey: 'sideways', forecastLabel: '10-20m Sideways / Wait', forecastConfidence: 0 });
+  assert.equal(app.text('forecastConfidence'), '0/100');
+  assert.match(app.text('scoreDetail'), /Sideways/);
+});

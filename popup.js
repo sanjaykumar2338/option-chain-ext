@@ -118,15 +118,19 @@
     currentScore.innerText = Number.isFinite(snapshot.totalScore)
       ? String(snapshot.totalScore)
       : "--";
-    forecastConfidence.innerText = Number.isFinite(snapshot.forecastConfidence)
-      ? `${snapshot.forecastConfidence}/100`
-      : "--";
+    const forecastWarming = snapshot.forecastKey === "warming"
+      || /warming/i.test(snapshot.forecastLabel || "");
+    forecastConfidence.innerText = forecastWarming ? "Collecting"
+      : Number.isFinite(snapshot.forecastConfidence) ? `${snapshot.forecastConfidence}/100` : "--";
+    const forecastText = forecastWarming
+      ? `Forecast collecting: ${snapshot.forecastDetail || "needs local price history (about 5–10 minutes)"}`
+      : snapshot.forecastLabel || "Forecast unavailable";
 
     const trendText = snapshot.hasTrendHistory
       ? `5m spot ${formatSignedPercent(snapshot.spotChangePct5m)}`
       : "trend collecting";
     scoreDetail.innerText =
-      `${snapshot.signalDetail || ""} | ${snapshot.dataQuality?.loadedRows ?? "--"} loaded strikes | OI PCR ${Number.isFinite(snapshot.metrics?.pcrOi) ? snapshot.metrics.pcrOi.toFixed(2) : "--"} | ${trendText} | ` +
+      `${snapshot.signalDetail || ""} | ${snapshot.dataQuality?.loadedRows ?? "--"} loaded strikes | OI PCR ${Number.isFinite(snapshot.metrics?.pcrOi) ? snapshot.metrics.pcrOi.toFixed(2) : "--"} | ${trendText} | ${forecastText} | ` +
       `Updated ${formatTime(snapshot.updatedAt)}`;
   }
 
