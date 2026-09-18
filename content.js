@@ -8,7 +8,8 @@
    */
 
   const NETWORK_EVENT_NAME = "upstox-option-chain-network-payload";
-  const FALLBACK_DEBOUNCE_MS = 700;
+  const FALLBACK_THROTTLE_MS = 250;
+  const DOM_REFRESH_INTERVAL_MS = 1000;
   const SIGNAL_REPEAT_NOTIFICATION_MS = 2 * 60 * 1000;
   const SIGNAL_TOAST_MS = 8000;
   const MARKET_HISTORY_WINDOW_MS = 30 * 60 * 1000;
@@ -31,27 +32,36 @@
   let fallbackTimer = null;
   let signalToastTimer = null;
 
+  function normalizeNumericText(value) {
+    return String(value ?? "").replace(/[\u2212\u2013\u2014]/g, "-")
+      .replace(/\uFF0B/g, "+").replace(/,/g, "").trim();
+  }
+
   function parseNumber(value) {
-    if (value == null) return NaN;
+    if (typeof value === "number") return Number.isFinite(value) ? value : NaN;
+    const match = normalizeNumericText(value).match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(Cr|crores?|L|lakhs?|K|thousands?)?\s*%?$/i);
+    if (!match) return NaN;
+    const unit = (match[2] || "").toLowerCase();
+    const multiplier = unit.startsWith("cr") ? 10000000
+      : unit.startsWith("l") ? 100000 : /^(k|thousand)/.test(unit) ? 1000 : 1;
+    return Number(match[1]) * multiplier;
+  }
 
-    const text = String(value)
-      .replace(/\u2212/g, "-")
-      .replace(/,/g, "")
-      .replace(/%/g, "")
-      .trim();
+  function parseCellNumber(value, header = "") {
+    const text = normalizeNumericText(value);
+    const match = text.match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(Cr|crores?|L|lakhs?|K|thousands?)?(?![a-z])/i);
+    if (!match || text.slice(match[0].length).trim().startsWith("%")) return NaN;
+    const numeric = parseNumber(match[0]);
+    // Explicit units on the value take precedence over table header units.
+    if (match[2]) return numeric;
+    if (/\b(lakhs?|lacs?)\b/i.test(header)) return numeric * 100000;
+    if (/\bcrores?\b/i.test(header)) return numeric * 10000000;
+    if (/\bthousands?\b/i.test(header)) return numeric * 1000;
+    return numeric;
+  }
 
-    if (!text || text === "--" || text === "-") return NaN;
-
-    const multiplier = /\bCr\b/i.test(text)
-      ? 10000000
-      : /\bL\b/i.test(text)
-        ? 100000
-        : /\bK\b/i.test(text)
-          ? 1000
-          : 1;
-
-    const numeric = Number.parseFloat(text.replace(/\b(Cr|L|K)\b/gi, "").trim());
-    return Number.isFinite(numeric) ? numeric * multiplier : NaN;
+  function parsePercentage(value) {
+    return parseNumber(normalizeNumericText(value).match(/[+-]?(?:\d+(?:\.\d*)?|\.\d+)\s*%/)?.[0]);
   }
 
   function safeNumber(value, fallback = 0) {
@@ -102,136 +112,108 @@
     return fallback;
   }
 
-  function normalizeNetworkSide(source) {
-    return {
-      ltp: safeNumber(firstFiniteValue(source, ["ltp", "lastPrice", "last_price", "lastTradedPrice"])),
-      ltpChangePct: safeNumber(firstFiniteValue(source, [
-        "ltpChangePct",
-        "ltp_change_pct",
-        "changePercent",
-        "change_percentage",
-        "priceChangePercent",
-        "pChange"
-      ])),
-      oiChg: safeNumber(firstFiniteValue(source, [
-        "oiChg",
-        "oi_change",
-        "openInterestChange",
-        "changeInOpenInterest",
-        "oiChange"
-      ])),
-      oiChgPct: safeNumber(firstFiniteValue(source, [
-        "oiChgPct",
-        "oi_change_pct",
-        "openInterestChangePercent",
-        "oiChangePercent"
-      ])),
-      volume: safeNumber(firstFiniteValue(source, ["volume", "tradedVolume", "totalTradedVolume"])),
-      iv: safeNumber(firstFiniteValue(source, ["iv", "impliedVolatility", "implied_volatility"])),
-      delta: safeNumber(firstFiniteValue(source, ["delta"])),
-      gamma: safeNumber(firstFiniteValue(source, ["gamma"])),
-      vega: safeNumber(firstFiniteValue(source, ["vega"])),
-      oi: safeNumber(firstFiniteValue(source, ["oi", "openInterest", "open_interest"]), NaN)
+  function normalizeNetworkSide(source = {}) {
+    const market = isPlainObject(source.market_data) ? source.market_data : source;
+    const greeks = isPlainObject(source.option_greeks) ? source.option_greeks : source;
+    const read = (keys) => firstFiniteValue(market, keys, firstFiniteValue(source, keys));
+    const result = {
+      ltp: read(["ltp", "lastPrice", "last_price", "lastTradedPrice"]),
+      ltpChangePct: read(["ltpChangePct", "ltp_change_pct", "changePercent", "change_percentage", "priceChangePercent", "pChange"]),
+      oi: read(["oi", "openInterest", "open_interest"]),
+      oiChg: read(["oiChg", "oi_change", "openInterestChange", "changeInOpenInterest", "oiChange"]),
+      oiChgPct: read(["oiChgPct", "oi_change_pct", "openInterestChangePercent", "oiChangePercent"]),
+      volume: read(["volume", "tradedVolume", "totalTradedVolume"]),
+      iv: firstFiniteValue(greeks, ["iv", "impliedVolatility", "implied_volatility"]),
+      delta: firstFiniteValue(greeks, ["delta"]),
+      gamma: firstFiniteValue(greeks, ["gamma"]),
+      vega: firstFiniteValue(greeks, ["vega"]),
+      theta: firstFiniteValue(greeks, ["theta"]),
+      closePrice: read(["close_price", "closePrice", "previousClose"]),
+      prevOi: read(["prev_oi", "prevOi", "previousOi"]),
+      bidPrice: read(["bid_price", "bidPrice", "bestBid"]),
+      askPrice: read(["ask_price", "askPrice", "bestAsk"]),
+      bidQty: read(["bid_qty", "bidQty", "bidQuantity"]),
+      askQty: read(["ask_qty", "askQty", "askQuantity"]),
+      instrumentKey: firstTextValue(source, ["instrument_key", "instrumentKey"])
     };
+    if (!Number.isFinite(result.ltpChangePct) && Number.isFinite(result.ltp) && result.closePrice > 0) {
+      result.ltpChangePct = (result.ltp / result.closePrice - 1) * 100;
+    }
+    if (!Number.isFinite(result.oiChg) && Number.isFinite(result.oi) && Number.isFinite(result.prevOi)) {
+      result.oiChg = result.oi - result.prevOi;
+    }
+    if (!Number.isFinite(result.oiChgPct) && Number.isFinite(result.oiChg) && result.prevOi > 0) {
+      result.oiChgPct = result.oiChg / result.prevOi * 100;
+    }
+    return result;
   }
 
   function mergeSide(primary, fallback) {
     const merged = { ...primary };
     Object.keys(fallback || {}).forEach((key) => {
-      if (Number.isFinite(fallback[key]) && (!Number.isFinite(merged[key]) || merged[key] === 0)) {
-        merged[key] = fallback[key];
-      }
+      if (Number.isFinite(fallback[key]) && !Number.isFinite(merged[key])) merged[key] = fallback[key];
+      if (key === "instrumentKey" && !merged[key]) merged[key] = fallback[key];
     });
     return merged;
   }
 
   function findOptionSideContainer(row, side) {
     if (!isPlainObject(row)) return null;
-
     const aliases = side === "call"
-      ? ["call", "ce", "CE", "Call", "CALL", "callOption", "callData"]
-      : ["put", "pe", "PE", "Put", "PUT", "putOption", "putData"];
-
-    for (const key of aliases) {
-      if (isPlainObject(row[key])) return row[key];
-    }
-
-    return null;
+      ? ["call_options", "call", "ce", "CE", "Call", "CALL", "callOption", "callData"]
+      : ["put_options", "put", "pe", "PE", "Put", "PUT", "putOption", "putData"];
+    return aliases.map((key) => row[key]).find(isPlainObject) || null;
   }
 
-  function normalizeNetworkStrike(row) {
+  function normalizeNetworkStrike(row, context = {}) {
     if (!isPlainObject(row)) return null;
-
-    const strike = firstFiniteValue(row, [
-      "strike",
-      "strikePrice",
-      "strike_price",
-      "sp",
-      "strike_price_value"
-    ]);
-    if (!Number.isFinite(strike)) return null;
-
-    const optionType = firstTextValue(row, ["optionType", "option_type", "instrumentType", "type"])
-      .toLowerCase();
+    const strike = firstFiniteValue(row, ["strike", "strikePrice", "strike_price", "sp", "strike_price_value"]);
+    if (!(strike > 0 && strike < Number.MAX_SAFE_INTEGER)) return null;
+    const optionType = firstTextValue(row, ["optionType", "option_type", "instrumentType", "type"]).toLowerCase();
     const callContainer = findOptionSideContainer(row, "call");
     const putContainer = findOptionSideContainer(row, "put");
-
-    if (callContainer || putContainer) {
-      return {
-        strike,
-        call: normalizeNetworkSide(callContainer || {}),
-        put: normalizeNetworkSide(putContainer || {})
-      };
-    }
-
-    if (optionType.includes("ce") || optionType.includes("call")) {
-      return { strike, call: normalizeNetworkSide(row), put: normalizeNetworkSide({}) };
-    }
-
-    if (optionType.includes("pe") || optionType.includes("put")) {
-      return { strike, call: normalizeNetworkSide({}), put: normalizeNetworkSide(row) };
-    }
-
-    return null;
+    const call = callContainer || (/^(ce|call)$/.test(optionType) ? row : null);
+    const put = putContainer || (/^(pe|put)$/.test(optionType) ? row : null);
+    if (!call && !put) return null;
+    return {
+      strike,
+      call: normalizeNetworkSide(call || {}),
+      put: normalizeNetworkSide(put || {}),
+      expiry: normalizeExpiry(firstTextValue(row, ["expiry", "expiry_date", "expiryDate"])) || context.expiry || "",
+      underlyingKey: firstTextValue(row, ["underlying_key", "underlyingKey", "underlying_instrument_key"]) || context.underlyingKey || "",
+      spotPrice: firstFiniteValue(row, ["underlying_spot_price", "spotPrice", "spot_price", "underlyingValue", "underlying_value"], context.spotPrice)
+    };
   }
 
-  function collectNetworkStrikes(payload, collected = []) {
+  function collectNetworkStrikes(payload, collected = [], context = {}, depth = 0) {
+    if (!payload || depth > 12 || collected.length >= 5000) return collected;
     if (Array.isArray(payload)) {
-      const normalizedRows = payload.map(normalizeNetworkStrike).filter(Boolean);
-      if (normalizedRows.length >= 2) collected.push(...normalizedRows);
-      payload.forEach((item) => collectNetworkStrikes(item, collected));
-      return collected;
+      payload.forEach((item) => collectNetworkStrikes(item, collected, context, depth + 1));
+    } else if (isPlainObject(payload)) {
+      const inherited = {
+        expiry: normalizeExpiry(firstTextValue(payload, ["expiry", "expiry_date", "expiryDate"])) || context.expiry || "",
+        underlyingKey: firstTextValue(payload, ["underlying_key", "underlyingKey", "underlying_instrument_key"]) || context.underlyingKey || "",
+        spotPrice: firstFiniteValue(payload, ["underlying_spot_price", "spotPrice", "spot_price", "underlyingValue", "underlying_value", "indexValue"], context.spotPrice)
+      };
+      const row = normalizeNetworkStrike(payload, inherited);
+      if (row) collected.push(row);
+      else Object.values(payload).forEach((value) => {
+        if (value && typeof value === "object") collectNetworkStrikes(value, collected, inherited, depth + 1);
+      });
     }
-
-    if (!isPlainObject(payload)) return collected;
-
-    const normalizedRow = normalizeNetworkStrike(payload);
-    if (normalizedRow) collected.push(normalizedRow);
-
-    Object.values(payload).forEach((value) => {
-      if (value && typeof value === "object") collectNetworkStrikes(value, collected);
-    });
-
     return collected;
   }
 
   function groupNetworkStrikes(rows) {
     const rowsByStrike = new Map();
-
     rows.forEach((row) => {
-      const existing = rowsByStrike.get(row.strike) || {
-        strike: row.strike,
-        call: normalizeNetworkSide({}),
-        put: normalizeNetworkSide({})
-      };
-
-      rowsByStrike.set(row.strike, {
-        strike: row.strike,
+      const existing = rowsByStrike.get(row.strike);
+      rowsByStrike.set(row.strike, existing ? {
+        ...existing,
         call: mergeSide(existing.call, row.call),
         put: mergeSide(existing.put, row.put)
-      });
+      } : row);
     });
-
     return Array.from(rowsByStrike.values()).sort((a, b) => a.strike - b.strike);
   }
 
@@ -257,107 +239,116 @@
     return NaN;
   }
 
-  function findFirstTextDeep(payload, keys, maxDepth = 5) {
-    if (maxDepth < 0 || payload == null) return "";
-    if (isPlainObject(payload)) {
-      const directValue = firstTextValue(payload, keys);
-      if (directValue) return directValue;
-
-      for (const value of Object.values(payload)) {
-        const nestedValue = findFirstTextDeep(value, keys, maxDepth - 1);
-        if (nestedValue) return nestedValue;
-      }
-    }
-
-    if (Array.isArray(payload)) {
-      for (const item of payload) {
-        const nestedValue = findFirstTextDeep(item, keys, maxDepth - 1);
-        if (nestedValue) return nestedValue;
-      }
-    }
-
-    return "";
-  }
-
   function getCellTexts(row) {
-    return Array.from(row.querySelectorAll("td")).map((cell) => {
-      return cell.innerText.replace(/\s+/g, " ").trim();
+    return Array.from(row.querySelectorAll("td")).map((cell) => String(cell.innerText ?? cell.textContent ?? "").replace(/\s+/g, " ").trim());
+  }
+
+  function columnField(header) {
+    const name = String(header || "").toLowerCase().replace(/[_-]/g, " ").replace(/\s+/g, " ").trim();
+    if (/^(oi|open interest)/.test(name)) {
+      if (/(chg|change)/.test(name)) return /%|percent/.test(name) ? "oiChgPct" : "oiChg";
+      return "oi";
+    }
+    if (/^(ltp|last (traded )?price)/.test(name)) return /%|percent/.test(name) ? "ltpChangePct" : "ltp";
+    if (/^(bid|buy).*(qty|quantity)/.test(name)) return "bidQty";
+    if (/^(ask|offer|sell).*(qty|quantity)/.test(name)) return "askQty";
+    if (/^(bid|buy)( price)?$/.test(name)) return "bidPrice";
+    if (/^(ask|offer|sell)( price)?$/.test(name)) return "askPrice";
+    if (/^(iv|implied volatility)(\b|$)/.test(name)) return "iv";
+    if (/^(volume|vol)(\b|$)/.test(name)) return "volume";
+    return ["delta", "gamma", "vega", "theta"].find((field) => name === field) || "";
+  }
+
+  function parseOptionRow(row, side) {
+    const cells = getCellTexts(row);
+    const table = row.closest?.("table");
+    const headers = Array.from(table?.querySelectorAll("thead th") || [])
+      .map((cell) => String(cell.innerText ?? cell.textContent ?? "").trim());
+    const result = normalizeNetworkSide({});
+    let fields;
+    let labels = headers;
+    if (headers.length) {
+      // A changed/hidden column must never shift unrelated values into Greeks.
+      if (headers.length !== cells.length) return result;
+      fields = headers.map(columnField);
+      if (!fields.includes("ltp") || new Set(fields.filter(Boolean)).size !== fields.filter(Boolean).length) return result;
+    } else {
+      // Only the observed ten-column Upstox layout has a fixed-index fallback.
+      if (cells.length !== 10) return result;
+      fields = side === "call"
+        ? ["volume", "iv", "vega", "gamma", "theta", "delta", "oiChg", "oi", "ltp", ""]
+        : ["", "ltp", "oi", "oiChg", "delta", "theta", "gamma", "vega", "iv", "volume"];
+      labels = fields.map((field) => field === "oi" ? "OI (lakhs)" : field);
+    }
+    fields.forEach((field, index) => {
+      if (!field) return;
+      result[field] = /Pct$/.test(field) ? parsePercentage(cells[index]) : parseCellNumber(cells[index], labels[index]);
+      if (field === "ltp") result.ltpChangePct = parsePercentage(cells[index]);
+      if (field === "oi") result.oiChgPct = parsePercentage(cells[index]);
     });
+    return result;
   }
 
-  function parseCallRow(row) {
-    const cells = getCellTexts(row);
-    const ltpText = cells[8] || "";
-    const oiText = cells[7] || "";
-
-    return {
-      ltp: safeNumber(parseNumber(ltpText.split(" ")[0])),
-      ltpChangePct: safeNumber(parseNumber(ltpText.match(/[+-]?\d+(?:\.\d+)?\s*%/)?.[0])),
-      oiChg: safeNumber(parseNumber(cells[6])),
-      oiChgPct: safeNumber(parseNumber(oiText.match(/[+-]?\d+(?:\.\d+)?\s*%/)?.[0])),
-      volume: safeNumber(parseNumber(cells[0])),
-      iv: safeNumber(parseNumber(cells[1])),
-      delta: safeNumber(parseNumber(cells[5])),
-      gamma: safeNumber(parseNumber(cells[3])),
-      vega: safeNumber(parseNumber(cells[2]))
-    };
-  }
-
-  function parsePutRow(row) {
-    const cells = getCellTexts(row);
-    const ltpText = cells[1] || "";
-    const oiText = cells[2] || "";
-
-    return {
-      ltp: safeNumber(parseNumber(ltpText.split(" ")[0])),
-      ltpChangePct: safeNumber(parseNumber(ltpText.match(/[+-]?\d+(?:\.\d+)?\s*%/)?.[0])),
-      oiChg: safeNumber(parseNumber(cells[3])),
-      oiChgPct: safeNumber(parseNumber(oiText.match(/[+-]?\d+(?:\.\d+)?\s*%/)?.[0])),
-      volume: safeNumber(parseNumber(cells[9])),
-      iv: safeNumber(parseNumber(cells[8])),
-      delta: safeNumber(parseNumber(cells[4])),
-      gamma: safeNumber(parseNumber(cells[6])),
-      vega: safeNumber(parseNumber(cells[7]))
-    };
-  }
+  function parseCallRow(row) { return parseOptionRow(row, "call"); }
+  function parsePutRow(row) { return parseOptionRow(row, "put"); }
 
   function getStrikeFromRow(row, side) {
-    const value = row.getAttribute("data-id")?.replace(`${side}TableOCRow`, "");
-    const strike = Number.parseInt(value || "", 10);
-    return Number.isSafeInteger(strike) && strike < Number.MAX_SAFE_INTEGER ? strike : NaN;
+    const value = row.getAttribute("data-id") || "";
+    const prefix = `${side}TableOCRow`;
+    if (!value.startsWith(prefix)) return NaN;
+    const strike = parseNumber(value.slice(prefix.length));
+    return strike > 0 && strike < Number.MAX_SAFE_INTEGER ? strike : NaN;
   }
 
   function scrapeOptionRows() {
-    const leftRows = Array.from(document.querySelectorAll('tr[data-id^="leftTableOCRow"]'));
-    const rightRowsByStrike = new Map(
-      Array.from(document.querySelectorAll('tr[data-id^="rightTableOCRow"]'))
-        .map((row) => [getStrikeFromRow(row, "right"), row])
-        .filter(([strike]) => Number.isFinite(strike))
-    );
-
-    return leftRows
-      .map((leftRow) => {
-        const strike = getStrikeFromRow(leftRow, "left");
-        const rightRow = rightRowsByStrike.get(strike);
-        if (!Number.isFinite(strike) || !rightRow) return null;
-
-        return {
-          strike,
-          call: parseCallRow(leftRow),
-          put: parsePutRow(rightRow)
-        };
-      })
-      .filter(Boolean)
-      .sort((a, b) => a.strike - b.strike);
+    const rowsByStrike = new Map();
+    for (const [position, side] of [["left", "call"], ["right", "put"]]) {
+      for (const row of document.querySelectorAll(`tr[data-id^="${position}TableOCRow"]`)) {
+        const strike = getStrikeFromRow(row, position);
+        if (!Number.isFinite(strike)) continue;
+        const current = rowsByStrike.get(strike) || { strike, call: normalizeNetworkSide({}), put: normalizeNetworkSide({}) };
+        current[side] = parseOptionRow(row, side);
+        rowsByStrike.set(strike, current);
+      }
+    }
+    return Array.from(rowsByStrike.values()).sort((a, b) => a.strike - b.strike);
   }
 
   function scrapeTickerValue(label) {
     const nodes = Array.from(document.querySelectorAll('[data-id="headerIndicesScripDropdown"]'));
-    const match = nodes.find((node) => node.innerText.toLowerCase().includes(label.toLowerCase()));
-    if (!match) return NaN;
+    const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+");
+    const pattern = new RegExp(`^${escapedLabel}\\s+(\\d[\\d,]*(?:\\.\\d+)?)`, "i");
 
-    const numericText = match.innerText.match(/\d[\d,]*(?:\.\d+)?/)?.[0];
-    return parseNumber(numericText);
+    for (const node of nodes) {
+      const numericText = node.innerText.trim().match(pattern)?.[1];
+      // A bare integer after the abbreviated NIFTY label may be part of an
+      // index name (NIFTY 50 / NIFTY 500). Require a formatted quote here;
+      // the full NIFTY 50 alias above can also read unformatted integer prices.
+      if (label.toUpperCase() === "NIFTY" && /^\d+$/.test(numericText || "")) continue;
+      const value = parseNumber(numericText);
+      if (Number.isFinite(value) && value > 0) return value;
+    }
+    return NaN;
+  }
+
+  function scrapeSpotPrice(stockName) {
+    const spotNode = document.querySelector('[data-id="spotPrice"]');
+    const spotText = spotNode?.innerText.match(/\d[\d,]*(?:\.\d+)?/)?.[0];
+    const spotPrice = parseNumber(spotText);
+    if (Number.isFinite(spotPrice) && spotPrice > 0) return spotPrice;
+
+    const indexName = getIndexName(stockName);
+    const aliases = {
+      "NIFTY 50": ["NIFTY 50", "NIFTY"],
+      "NIFTY BANK": ["NIFTY BANK", "BANK NIFTY", "BANKNIFTY"],
+      "NIFTY FIN SERVICE": ["NIFTY FIN SERVICE", "FINNIFTY"],
+      "NIFTY MID SELECT": ["NIFTY MID SELECT", "MIDCPNIFTY"]
+    };
+    for (const label of aliases[indexName] || [stockName]) {
+      const value = scrapeTickerValue(label);
+      if (Number.isFinite(value)) return value;
+    }
+    return NaN;
   }
 
   function scrapeIndiaVix() {
@@ -403,10 +394,10 @@
     if (normalized.includes("BANKNIFTY") || normalized.includes("NIFTYBANK")) {
       return "NIFTY BANK";
     }
-    if (normalized.includes("FINNIFTY")) {
+    if (normalized.includes("FINNIFTY") || normalized.includes("NIFTYFINSERVICE")) {
       return "NIFTY FIN SERVICE";
     }
-    if (normalized.includes("MIDCPNIFTY")) {
+    if (normalized.includes("MIDCPNIFTY") || normalized.includes("NIFTYMIDSELECT")) {
       return "NIFTY MID SELECT";
     }
     if (normalized.includes("NIFTY")) {
@@ -422,93 +413,154 @@
     return "Stock Option";
   }
 
-  function scrapeMaxPain(strikes, spotPrice) {
-    const bodyText = document.body.innerText;
-    const labelledValue = bodyText.match(/Max\s*pain\s*[:\-]?\s*(\d[\d,]*(?:\.\d+)?)/i)?.[1];
-    if (labelledValue) return parseNumber(labelledValue);
-
-    if (!strikes.length || !Number.isFinite(spotPrice)) return NaN;
-    return strikes.reduce((nearest, row) => {
-      return Math.abs(row.strike - spotPrice) < Math.abs(nearest - spotPrice) ? row.strike : nearest;
-    }, strikes[0].strike);
+  function scrapeMaxPain() {
+    const bodyText = document.body?.innerText || "";
+    return parseNumber(bodyText.match(/Max\s*pain\s*[:\-]?\s*(\d[\d,]*(?:\.\d+)?)/i)?.[1]);
   }
 
-  function getActiveStrikes(strikes, spotPrice) {
-    if (!strikes.length) return [];
+  function normalizeExpiry(value) {
+    const text = String(value || "").trim();
+    const iso = text.match(/^(20\d{2})-(\d{2})-(\d{2})(?:$|T)/);
+    const label = text.match(/\b(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(20\d{2})\b/i);
+    const months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+    const year = iso ? Number(iso[1]) : label ? Number(label[3]) : NaN;
+    const month = iso ? Number(iso[2]) : label ? months.indexOf(label[2].toLowerCase()) + 1 : NaN;
+    const day = iso ? Number(iso[3]) : label ? Number(label[1]) : NaN;
+    if (!Number.isFinite(year)) return "";
+    const parsed = new Date(Date.UTC(year, month - 1, day));
+    if (parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month - 1 || parsed.getUTCDate() !== day) return "";
+    return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  }
 
-    const ranked = [...strikes].sort((a, b) => {
-      return Math.abs(a.strike - spotPrice) - Math.abs(b.strike - spotPrice);
+  function scrapeExpiry() {
+    // The captured Upstox page uses checked radio inputs named by expiry date.
+    const selectors = ['input[type="radio"]:checked', '[role="tab"][aria-selected="true"]', '[data-expiry][aria-selected="true"]'];
+    for (const selector of selectors) {
+      for (const node of document.querySelectorAll(selector)) {
+        const expiry = normalizeExpiry(node.getAttribute("data-expiry"))
+          || normalizeExpiry(node.getAttribute("name")) || normalizeExpiry(node.innerText);
+        if (expiry) return expiry;
+      }
+    }
+    return "";
+  }
+
+  function canonicalUnderlyingKey(value) {
+    const parts = String(value || "").trim().split("|");
+    if (parts.length !== 2) return String(value || "").toUpperCase().replace(/\s+/g, "");
+    const name = getIndexName(parts[1]);
+    return `${parts[0].toUpperCase()}|${(name === "Stock Option" ? parts[1] : name).toUpperCase().replace(/\s+/g, "")}`;
+  }
+
+  function scrapeUnderlyingKey(stockName) {
+    const selected = document.querySelector('[data-id="searchButtonPrefillOC"]');
+    const explicit = selected?.getAttribute?.("data-instrument-key");
+    if (explicit) return explicit;
+    let parts;
+    try { parts = decodeURIComponent(window.location.pathname).split("/").filter(Boolean); } catch (_error) { parts = []; }
+    const chainIndex = parts.indexOf("option-chain");
+    const exchange = parts[chainIndex + 1];
+    const routeSymbol = parts[chainIndex + 2];
+    if (routeSymbol && /^[A-Z]+_(INDEX|EQ)$/i.test(exchange)) {
+      return `${exchange}|${exchange.endsWith("INDEX") ? getIndexName(stockName) : routeSymbol}`;
+    }
+    return "";
+  }
+
+  function buildMarketKey(stockName, expiry, underlyingKey) {
+    return [String(stockName).toUpperCase().replace(/\s+/g, ""), expiry || "unknown-expiry", canonicalUnderlyingKey(underlyingKey)].join("::");
+  }
+
+  let networkSupplement = null;
+
+  function mergeStrikeSources(primary, fallback) {
+    const fallbackByStrike = new Map(fallback.map((row) => [row.strike, row]));
+    const rows = primary.map((row) => {
+      const other = fallbackByStrike.get(row.strike);
+      fallbackByStrike.delete(row.strike);
+      return other ? { ...row, call: mergeSide(row.call, other.call), put: mergeSide(row.put, other.put) } : row;
     });
-
-    return ranked.slice(0, 10).sort((a, b) => a.strike - b.strike);
+    return [...rows, ...fallbackByStrike.values()].sort((a, b) => a.strike - b.strike);
   }
 
-  function scrapeMarketState() {
-    const allStrikes = scrapeOptionRows();
-    const sensex = scrapeTickerValue("SENSEX");
-    const nifty = scrapeTickerValue("NIFTY");
-    const spotPrice = Number.isFinite(sensex) ? sensex : nifty;
-    const strikes = getActiveStrikes(allStrikes, spotPrice);
+  function scrapeMarketState(includeNetwork = true) {
     const stockName = scrapeStockName();
-
-    return {
-      stockName,
-      indexName: getIndexName(stockName),
-      spotPrice,
-      maxPain: scrapeMaxPain(allStrikes, spotPrice),
-      indiaVix: scrapeIndiaVix(),
-      timestamp: Date.now(),
-      strikes
+    const expiry = scrapeExpiry();
+    const underlyingKey = scrapeUnderlyingKey(stockName);
+    const marketKey = buildMarketKey(stockName, expiry, underlyingKey);
+    const state = {
+      stockName, indexName: getIndexName(stockName), expiry, underlyingKey, marketKey,
+      spotPrice: scrapeSpotPrice(stockName), maxPain: scrapeMaxPain(), indiaVix: scrapeIndiaVix(),
+      timestamp: Date.now(), strikes: scrapeOptionRows(), source: "dom"
     };
+    if (networkSupplement && (networkSupplement.marketKey !== marketKey || state.timestamp - networkSupplement.timestamp > 15000 || state.timestamp < networkSupplement.timestamp)) {
+      networkSupplement = null;
+    }
+    if (includeNetwork && networkSupplement) {
+      state.strikes = mergeStrikeSources(state.strikes, networkSupplement.strikes);
+      if (!Number.isFinite(state.spotPrice)) state.spotPrice = networkSupplement.spotPrice;
+      if (!Number.isFinite(state.maxPain)) state.maxPain = networkSupplement.maxPain;
+      if (!Number.isFinite(state.indiaVix)) state.indiaVix = networkSupplement.indiaVix;
+      state.source = "dom+network";
+      state.networkTimestamp = networkSupplement.timestamp;
+    }
+    return state;
+  }
+
+  function networkRequestContext(detail) {
+    try {
+      const url = new URL(detail?.url || "", "https://pro.upstox.com");
+      return {
+        underlyingKey: url.searchParams.get("instrument_key") || url.searchParams.get("underlying_key") || "",
+        expiry: normalizeExpiry(url.searchParams.get("expiry_date") || url.searchParams.get("expiry"))
+      };
+    } catch (_error) { return {}; }
   }
 
   function parseNetworkMarketState(detail) {
-    const payload = detail?.payload;
-    const allStrikes = groupNetworkStrikes(collectNetworkStrikes(payload));
+    const fallbackState = scrapeMarketState(false);
+    const timestamp = Number.isFinite(detail?.timestamp) ? detail.timestamp : Date.now();
+    if (Date.now() - timestamp > 15000 || timestamp > Date.now() + 1000) return null;
+    const context = networkRequestContext(detail);
+    const rows = collectNetworkStrikes(detail?.payload, [], context);
+    // Unidentified responses cannot safely be assigned to the selected chain.
+    const allStrikes = groupNetworkStrikes(rows.filter((row) => {
+      if (!fallbackState.expiry || !row.expiry || row.expiry !== fallbackState.expiry) return false;
+      if (!fallbackState.underlyingKey || !row.underlyingKey) return false;
+      return canonicalUnderlyingKey(row.underlyingKey) === canonicalUnderlyingKey(fallbackState.underlyingKey);
+    }));
     if (!allStrikes.length) return null;
-
-    const fallbackState = scrapeMarketState();
-    const payloadSpot = findFirstNumberDeep(payload, [
-      "spotPrice",
-      "spot_price",
-      "underlyingValue",
-      "underlying_value",
-      "indexValue",
-      "lastPrice"
-    ]);
-    const spotPrice = Number.isFinite(payloadSpot) ? payloadSpot : fallbackState.spotPrice;
-    const stockName = cleanStockName(findFirstTextDeep(payload, [
-      "symbol",
-      "tradingSymbol",
-      "trading_symbol",
-      "underlyingSymbol",
-      "underlying",
-      "name"
-    ])) || fallbackState.stockName;
-    const maxPain = findFirstNumberDeep(payload, ["maxPain", "max_pain"]);
-    const indiaVix = findFirstNumberDeep(payload, ["indiaVix", "india_vix", "vix"]);
-
+    const payloadSpot = allStrikes.find((row) => Number.isFinite(row.spotPrice) && row.spotPrice > 0)?.spotPrice;
+    const payload = detail?.payload;
+    // Metadata is only accepted at response scope after every parsed row matches.
+    const allRowsMatch = allStrikes.length === groupNetworkStrikes(rows).length
+      && rows.every((row) => row.expiry === fallbackState.expiry && canonicalUnderlyingKey(row.underlyingKey) === canonicalUnderlyingKey(fallbackState.underlyingKey));
+    const maxPain = allRowsMatch ? findFirstNumberDeep(payload, ["maxPain", "max_pain"]) : NaN;
+    const indiaVix = allRowsMatch ? findFirstNumberDeep(payload, ["indiaVix", "india_vix", "vix"]) : NaN;
+    networkSupplement = {
+      ...fallbackState, timestamp, strikes: allStrikes,
+      spotPrice: Number.isFinite(payloadSpot) ? payloadSpot : fallbackState.spotPrice,
+      maxPain, indiaVix
+    };
     return {
-      stockName,
-      indexName: getIndexName(stockName),
-      spotPrice,
-      maxPain: Number.isFinite(maxPain) ? maxPain : scrapeMaxPain(allStrikes, spotPrice),
-      indiaVix: Number.isFinite(indiaVix) ? indiaVix : fallbackState.indiaVix,
-      timestamp: Number.isFinite(detail?.timestamp) ? detail.timestamp : Date.now(),
-      strikes: getActiveStrikes(allStrikes, spotPrice),
-      source: detail?.source || "network"
+      ...fallbackState,
+      spotPrice: Number.isFinite(fallbackState.spotPrice) ? fallbackState.spotPrice : payloadSpot,
+      maxPain: Number.isFinite(fallbackState.maxPain) ? fallbackState.maxPain : maxPain,
+      indiaVix: Number.isFinite(fallbackState.indiaVix) ? fallbackState.indiaVix : indiaVix,
+      timestamp, networkTimestamp: timestamp,
+      strikes: mergeStrikeSources(fallbackState.strikes, allStrikes),
+      source: `dom+${detail?.source || "network"}`
     };
   }
 
   function getHistoryForMarket(marketState) {
-    return marketHistory.filter((state) => state.stockName === marketState.stockName);
+    return marketHistory.filter((state) => engine.marketKey(state) === engine.marketKey(marketState));
   }
 
   function rememberMarketState(marketState) {
     const cutoff = marketState.timestamp - MARKET_HISTORY_WINDOW_MS;
-    marketHistory = marketHistory
-      .filter((state) => state.timestamp >= cutoff && state.stockName === marketState.stockName)
-      .concat(marketState);
+    marketHistory = marketHistory.filter((state) => state.timestamp >= cutoff && engine.marketKey(state) === engine.marketKey(marketState));
+    if (!marketHistory.length || marketState.timestamp - marketHistory.at(-1).timestamp >= 5000) marketHistory.push(marketState);
   }
 
   function createOverlay() {
@@ -686,31 +738,9 @@
   }
 
   function getRiskMatrix(result) {
-    const atmStrike = getAtmStrike(result.marketState);
-    const side = result.signal.key === "call"
-      ? atmStrike?.call
-      : result.signal.key === "put"
-        ? atmStrike?.put
-        : null;
-    const entryPrice = side?.ltp;
-
-    if (!Number.isFinite(entryPrice) || entryPrice <= 0) {
-      return {
-        action: result.signal.label,
-        strike: atmStrike?.strike,
-        entryPrice: NaN,
-        stopLoss: NaN,
-        target: NaN
-      };
-    }
-
-    return {
-      action: result.signal.label,
-      strike: atmStrike.strike,
-      entryPrice,
-      stopLoss: Math.max(0, entryPrice - 20),
-      target: entryPrice + 100
-    };
+    const candidate = isBuySignal(result) ? result.candidate : null;
+    return { action: result.signal.label, strike: candidate?.strike,
+      entryPrice: candidate?.ltp, stopLoss: NaN, target: NaN };
   }
 
   function formatPrice(value) {
@@ -718,12 +748,9 @@
   }
 
   function formatRiskMatrix(result) {
-    const risk = getRiskMatrix(result);
-    if (!["call", "put"].includes(result.signal.key)) {
-      return `Action: ${risk.action} | Entry: -- | SL: -- | Target: --`;
-    }
-
-    return `Action: ${risk.action} ${risk.strike || ""} | Entry: ${formatPrice(risk.entryPrice)} | SL: ${formatPrice(risk.stopLoss)} | Target: ${formatPrice(risk.target)}`;
+    const candidate = isBuySignal(result) ? result.candidate : null;
+    if (!candidate) return "No entry candidate";
+    return `${candidate.strike} ${candidate.side === "call" ? "CE" : "PE"} | LTP ${formatPrice(candidate.ltp)} | Spread ${formatPrice(candidate.spreadPct)}% | Δ ${formatPrice(candidate.delta)} | IV ${formatPrice(candidate.iv)} | θ ${formatPrice(candidate.theta)}`;
   }
 
   function updateOverlay(result) {
@@ -732,14 +759,14 @@
     const trendText = result.trend.hasEnoughHistory
       ? `5m Spot: ${formatSignedPercent(result.trend.spotChangePct)}`
       : "Trend: collecting";
-    overlay.querySelector('[data-role="stock"]').innerText = result.marketState.stockName;
+    overlay.querySelector('[data-role="stock"]').innerText = `${result.marketState.stockName} | ${result.marketState.expiry || "Expiry unavailable"}`;
     overlay.querySelector('[data-role="signal"]').innerText = result.signal.label;
     overlay.querySelector('[data-role="meta"]').innerText =
-      `${result.marketState.indexName} | Strength ${result.strength}/100`;
+      `${result.marketState.strikes.length} loaded strikes | Score ${result.totalScore} | Data ${result.dataQuality?.score ?? 0}/100`;
     overlay.querySelector('[data-role="forecast"]').innerText =
-      `${result.forecast.label} | Confidence ${result.forecast.confidence}/100`;
+      `${formatRiskMatrix(result)} | OI PCR ${formatPrice(result.metrics?.pcrOi)}`;
     overlay.querySelector('[data-role="detail"]').innerText =
-      `${result.signal.detail} | ${formatRiskMatrix(result)} | ${trendText} | ${formatForecastTrend(result.forecast)} | Updated: ${formatTime(result.marketState.timestamp)} | Source: ${result.marketState.source || "dom"}`;
+      `${result.signal.detail} | ${(result.reasons || []).join("; ")} | ${trendText} | Support ${result.metrics?.support?.strike || "--"} / Resistance ${result.metrics?.resistance?.strike || "--"} | ${(result.candidate?.warnings || result.dataQuality?.warnings || []).join("; ")} | Data changed: ${formatTime(result.marketState.dataUpdatedAt)} | Checked: ${formatTime(result.marketState.timestamp)}`;
   }
 
   function showSignalToast(result, isRepeat) {
@@ -844,6 +871,14 @@
         forecastScore: result.forecast.score,
         spotPrice: result.marketState.spotPrice,
         risk,
+        expiry: result.marketState.expiry,
+        marketKey: engine.marketKey(result.marketState),
+        dataQuality: result.dataQuality,
+        reasons: result.reasons,
+        blockers: result.blockers,
+        metrics: result.metrics,
+        candidate: result.candidate,
+        dataUpdatedAt: result.marketState.dataUpdatedAt,
         spotChangePct5m: result.trend.spotChangePct,
         hasTrendHistory: result.trend.hasEnoughHistory,
         updatedAt: result.marketState.timestamp
@@ -894,6 +929,7 @@
       signalKey: result.signal.key,
       signalLabel: result.signal.label,
       stockName: result.marketState.stockName,
+      marketKey: engine.marketKey(result.marketState),
       indexName: result.marketState.indexName,
       entrySpot: result.marketState.spotPrice,
       entryTime: result.marketState.timestamp,
@@ -918,7 +954,7 @@
 
         if (
           record.status !== "pending" ||
-          record.stockName !== marketState.stockName ||
+          record.marketKey !== engine.marketKey(marketState) ||
           !isReady
         ) {
           return record;
@@ -961,24 +997,26 @@
       stockName: result.marketState.stockName,
       detail: `${result.signal.detail}. Strength ${result.strength}/100. ${result.forecast.label} ${result.forecast.confidence}/100. ${trendText}.`,
       meta: result.marketState.indexName
-    }, () => {
+    }, (response) => {
       const lastError = chrome.runtime.lastError;
       if (lastError) {
         console.warn("[Upstox Quant Signal] Notification send failed", lastError.message);
+      } else if (response?.ok === false && response.reason !== "disabled") {
+        console.warn("[Upstox Quant Signal] Notification failed", response.error);
       }
     });
   }
 
   function handleSignalTransition(result) {
     const previousSignalKey = lastSignalKey;
-    const signalChanged = result.signal.key !== previousSignalKey;
+    const signalChanged = result.signal.key !== previousSignalKey || engine.marketKey(result.marketState) !== lastNotification.marketKey;
     lastSignalKey = result.signal.key;
 
     if (!isBuySignal(result)) return;
 
     const notificationChanged =
       result.signal.key !== lastNotification.signalKey ||
-      result.marketState.stockName !== lastNotification.stockName;
+      engine.marketKey(result.marketState) !== lastNotification.marketKey;
     const notificationStale =
       result.marketState.timestamp - lastNotification.timestamp >= SIGNAL_REPEAT_NOTIFICATION_MS;
 
@@ -990,6 +1028,7 @@
     }
 
     lastNotification = {
+      marketKey: engine.marketKey(result.marketState),
       signalKey: result.signal.key,
       stockName: result.marketState.stockName,
       timestamp: result.marketState.timestamp
@@ -1006,12 +1045,57 @@
     overlay.querySelector('[data-role="meta"]').innerText = formatTime(Date.now());
     overlay.querySelector('[data-role="forecast"]').innerText = "10-20m Forecast Warming Up";
     overlay.querySelector('[data-role="detail"]').innerText = message;
+    lastSignalKey = null;
+    const toast = document.getElementById(SIGNAL_TOAST_ID);
+    if (toast) toast.style.display = "none";
+    globalThis.chrome?.storage?.local?.set({ [LATEST_SIGNAL_STORAGE_KEY]: {
+      stockName, signalKey: "neutral", signalLabel: "WAITING", signalDetail: message, updatedAt: Date.now()
+    } });
+  }
+
+  let freshness = null;
+
+  function isOptionChainPage() {
+    return /^\/option-chain(?:\/|$)/.test(window.location.pathname);
+  }
+
+  function stampDataStatus(state) {
+    const now = Date.now();
+    const key = engine.marketKey(state);
+    const rows = new Map(state.strikes.map((row) => [row.strike, row]));
+    let changed = false;
+    if (freshness?.key === key) {
+      changed = Number.isFinite(state.spotPrice) && Number.isFinite(freshness.spot) && state.spotPrice !== freshness.spot;
+      for (const [strike, row] of rows) {
+        const previous = freshness.rows.get(strike);
+        if (!previous) continue;
+        for (const side of ["call", "put"]) for (const field of ["ltp", "oi", "volume"]) {
+          if (Number.isFinite(row[side]?.[field]) && Number.isFinite(previous[side]?.[field]) && row[side][field] !== previous[side][field]) changed = true;
+        }
+      }
+    } else freshness = { key, updatedAt: now, observed: false };
+    freshness = { ...freshness, rows, spot: state.spotPrice,
+      updatedAt: changed ? now : freshness.updatedAt, observed: freshness.observed || changed };
+    state.timestamp = now;
+    state.dataUpdatedAt = freshness.updatedAt;
+    state.hasObservedChange = freshness.observed;
+    const ist = new Date(now + 19800000);
+    const minutes = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+    // Regular equity derivatives session; no holiday/special-session calendar.
+    const closeMinute = ist.toISOString().slice(0, 10) >= "2026-08-03" ? 940 : 930;
+    state.sessionOpen = ist.getUTCDay() > 0 && ist.getUTCDay() < 6 && minutes >= 555 && minutes < closeMinute;
   }
 
   function processMarketState(marketState) {
     try {
+      if (!isOptionChainPage()) return;
+      stampDataStatus(marketState);
       if (!marketState.strikes.length) {
         updateOverlayError("Option-chain rows not ready", marketState.stockName);
+        return;
+      }
+      if (!Number.isFinite(marketState.spotPrice) || marketState.spotPrice <= 0) {
+        updateOverlayError("Waiting for the selected option chain's spot price", marketState.stockName);
         return;
       }
 
@@ -1029,16 +1113,31 @@
   }
 
   function runFallbackDomCycle() {
-    processMarketState(scrapeMarketState());
+    window.clearTimeout(fallbackTimer);
+    fallbackTimer = null;
+    try {
+      if (!isOptionChainPage()) {
+        document.getElementById(OVERLAY_ID)?.remove();
+        document.getElementById(SIGNAL_TOAST_ID)?.remove();
+        marketHistory = []; freshness = null; networkSupplement = null; lastSignalKey = null;
+        return;
+      }
+      processMarketState(scrapeMarketState());
+    } catch (error) {
+      console.warn("[Upstox Quant Signal] DOM read failed", error);
+      updateOverlayError("Waiting for option-chain data to refresh");
+    }
   }
 
   function scheduleFallbackDomCycle() {
-    window.clearTimeout(fallbackTimer);
-    fallbackTimer = window.setTimeout(runFallbackDomCycle, FALLBACK_DEBOUNCE_MS);
+    // Do not postpone an already scheduled check on each incoming quote.
+    if (fallbackTimer !== null) return;
+    fallbackTimer = window.setTimeout(runFallbackDomCycle, FALLBACK_THROTTLE_MS);
   }
 
   function handleNetworkPayload(event) {
     try {
+      if (!isOptionChainPage()) return;
       const marketState = parseNetworkMarketState(event.detail);
       if (!marketState?.strikes.length) return;
       processMarketState(marketState);
@@ -1054,7 +1153,7 @@
         const targetElement = mutation.target?.nodeType === Node.ELEMENT_NODE
           ? mutation.target
           : mutation.target?.parentElement;
-        if (targetElement?.closest?.('tr[data-id^="leftTableOCRow"],tr[data-id^="rightTableOCRow"]')) {
+        if (targetElement?.closest?.('tr[data-id^="leftTableOCRow"],tr[data-id^="rightTableOCRow"],[data-id="spotPrice"],[data-id="searchButtonPrefillOC"]')) {
           return true;
         }
 
@@ -1076,6 +1175,13 @@
   }
 
   window.addEventListener(NETWORK_EVENT_NAME, handleNetworkPayload);
+  window.addEventListener("focus", scheduleFallbackDomCycle);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) scheduleFallbackDomCycle();
+  });
+  document.addEventListener("change", scheduleFallbackDomCycle);
   installDomFallbackObserver();
+  window.dispatchEvent(new CustomEvent("upstox-option-chain-request-latest"));
   runFallbackDomCycle();
+  window.setInterval(runFallbackDomCycle, DOM_REFRESH_INTERVAL_MS);
 })();

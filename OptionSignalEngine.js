@@ -8,7 +8,7 @@
    */
 
   const TREND_LOOKBACK_MS = 5 * 60 * 1000;
-  const MIN_TREND_AGE_MS = 60 * 1000;
+  const MIN_TREND_AGE_MS = 30 * 1000;
   const FORECAST_LOOKBACKS_MS = [5, 10, 15].map((minutes) => minutes * 60 * 1000);
   const OI_VELOCITY_WINDOW_MS = 3 * 60 * 1000;
   const OI_VELOCITY_LOOKBACKS_MS = [60 * 1000, 3 * 60 * 1000];
@@ -24,7 +24,7 @@
      */
     analyze(marketState, history = []) {
       const normalizedMarketState = this.normalizeMarketState(marketState);
-      const normalizedHistory = this.normalizeHistory(history);
+      const normalizedHistory = this.normalizeHistory(history.filter((state) => this.marketKey(state) === this.marketKey(marketState)));
       const trend = this.calculateTrend(normalizedMarketState, normalizedHistory);
       const directionalBuildUp = this.scoreDirectionalBuildUp(normalizedMarketState);
       const oiVelocity = this.scoreOiVelocity(normalizedMarketState);
@@ -32,21 +32,28 @@
       const factors = {
         directionalBuildUp,
         oiVelocity,
+        fastMomentum: this.scoreFastMomentum(normalizedMarketState, normalizedHistory),
         pcrContext: this.scorePcrContext(normalizedMarketState, trend),
         spotTrend: this.scoreSpotTrend(trend),
         spotConfirmation: this.scoreSpotConfirmation(directionalBuildUp, trend),
-        maxPain: this.scoreMaxPain(normalizedMarketState),
-        ivSkew: this.scoreIvSkew(normalizedMarketState),
-        gammaWall: this.calculateGammaWallScore(
-          normalizedMarketState.strikes,
-          normalizedMarketState.spotPrice
-        ),
-        vegaSkew: this.calculateVegaSkewScore(normalizedMarketState.strikes)
+        maxPain: 0,
+        ivSkew: 0,
+        gammaWall: 0,
+        vegaSkew: 0
       };
 
       const rawScore = Object.values(factors).reduce((sum, value) => sum + value, 0);
       const totalScore = this.clamp(Math.round(rawScore), -100, 100);
-      const signal = this.getSignal(totalScore, trend);
+      let signal = this.getSignal(totalScore, trend);
+      const dataQuality = this.assessData(marketState);
+      const metrics = this.calculateMarketMetrics(normalizedMarketState);
+      const candidate = signal.key === "neutral" ? null : this.selectCandidate(marketState, signal.key);
+      const blockers = [...dataQuality.issues];
+      if (signal.key !== "neutral" && !candidate) blockers.push("No liquid nearby contract with usable prices and Greeks");
+      if (blockers.length) signal = { key: "neutral", label: "WAIT", detail: blockers[0], color: "#64748b" };
+      const reasons = Object.entries(factors).filter(([, value]) => Math.abs(value) >= 3)
+        .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1])).slice(0, 3)
+        .map(([name, value]) => `${name.replace(/([A-Z])/g, " $1")}: ${value > 0 ? "+" : ""}${Math.round(value)}`);
       const forecast = this.calculateForecast(
         totalScore,
         directionalBuildUp,
@@ -61,6 +68,7 @@
         signal,
         forecast,
         factors,
+        dataQuality, metrics, candidate: blockers.length ? null : candidate, blockers, reasons,
         trend,
         marketState: normalizedMarketState
       };
@@ -97,6 +105,8 @@
 
     normalizeSide(side = {}) {
       return {
+        ...side,
+        _hasCoreData: side._hasCoreData ?? ["ltp", "ltpChangePct", "oi", "oiChg", "volume"].every((key) => Number.isFinite(side[key])),
         ltp: this.toFiniteNumber(side.ltp),
         ltpChangePct: this.toFiniteNumber(side.ltpChangePct),
         oiChg: this.toFiniteNumber(side.oiChg),
@@ -150,7 +160,7 @@
     getLookbackState(currentState, history, targetLookbackMs) {
       const eligible = history.filter((state) => {
         const ageMs = currentState.timestamp - state.timestamp;
-        return ageMs >= MIN_TREND_AGE_MS && ageMs <= targetLookbackMs;
+        return ageMs >= Math.min(targetLookbackMs * 0.8, TREND_LOOKBACK_MS * 0.8) && ageMs <= targetLookbackMs + 15000;
       });
 
       if (!eligible.length) return null;
@@ -189,8 +199,11 @@
     }
 
     calculateMarketMetrics(marketState) {
-      const totals = marketState.strikes.reduce((sum, row) => {
+      const coveredRows = marketState.strikes.filter((row) => row.call._hasCoreData && row.put._hasCoreData);
+      const totals = coveredRows.reduce((sum, row) => {
         return {
+          callOi: sum.callOi + Math.max(this.toFiniteNumber(row.call.oi), 0),
+          putOi: sum.putOi + Math.max(this.toFiniteNumber(row.put.oi), 0),
           putOiChg: sum.putOiChg + Math.max(row.put.oiChg, 0),
           callOiChg: sum.callOiChg + Math.max(row.call.oiChg, 0),
           putVolume: sum.putVolume + Math.max(row.put.volume, 0),
@@ -199,6 +212,7 @@
           avgCallLtpChange: sum.avgCallLtpChange + row.call.ltpChangePct
         };
       }, {
+        callOi: 0, putOi: 0,
         putOiChg: 0,
         callOiChg: 0,
         putVolume: 0,
@@ -207,13 +221,20 @@
         avgCallLtpChange: 0
       });
 
-      const rowCount = marketState.strikes.length || 1;
+      const rowCount = coveredRows.length || 1;
 
       return {
         ...totals,
         avgPutLtpChange: totals.avgPutLtpChange / rowCount,
         avgCallLtpChange: totals.avgCallLtpChange / rowCount,
-        pcrOi: totals.callOiChg > 0 ? totals.putOiChg / totals.callOiChg : NaN,
+        pcrOi: totals.callOi > 0 ? totals.putOi / totals.callOi : NaN,
+        pcrOiChange: totals.callOiChg > 0 ? totals.putOiChg / totals.callOiChg : NaN,
+        support: this.oiLevel(marketState, "put"),
+        resistance: this.oiLevel(marketState, "call"),
+        maxPain: marketState.maxPain,
+        indiaVix: marketState.indiaVix,
+        coveredRows: coveredRows.length,
+        gammaOi: marketState.strikes.reduce((sum, row) => sum + [row.call, row.put].reduce((n, side) => n + Math.max(0, this.toFiniteNumber(side.gamma)) * Math.max(0, this.toFiniteNumber(side.oi)), 0), 0),
         pcrVolume: totals.callVolume > 0 ? totals.putVolume / totals.callVolume : NaN
       };
     }
@@ -223,7 +244,7 @@
 
       const strikeStep = this.estimateStrikeStep(marketState.strikes);
       const sigma = Math.max(strikeStep * 3, 1);
-      const scoredRows = marketState.strikes.map((row) => {
+      const scoredRows = marketState.strikes.filter((row) => row.call._hasCoreData && row.put._hasCoreData).map((row) => {
         const atmWeight = this.calculateGaussianAtmWeight(row.strike, marketState.spotPrice, sigma);
         const activityWeight = Math.log1p(
           Math.abs(row.call.oiChg) +
@@ -333,7 +354,7 @@
     }
 
     rememberOiSnapshot(marketState) {
-      const marketKey = marketState.stockName || "Option Chain";
+      const marketKey = this.marketKey(marketState);
       const cutoff = marketState.timestamp - OI_VELOCITY_WINDOW_MS;
       const snapshots = (this.oiHistoryByMarket.get(marketKey) || [])
         .filter((snapshot) => snapshot.timestamp >= cutoff);
@@ -353,11 +374,11 @@
     }
 
     getOiLookbackSnapshot(marketState, lookbackMs) {
-      const marketKey = marketState.stockName || "Option Chain";
+      const marketKey = this.marketKey(marketState);
       const snapshots = this.oiHistoryByMarket.get(marketKey) || [];
       const eligible = snapshots.filter((snapshot) => {
         const ageMs = marketState.timestamp - snapshot.timestamp;
-        return ageMs >= MIN_TREND_AGE_MS && ageMs <= lookbackMs;
+        return ageMs >= Math.max(30000, lookbackMs - 15000) && ageMs <= lookbackMs + 15000;
       });
 
       if (!eligible.length) return null;
@@ -389,7 +410,7 @@
           const previous = entry.snapshot.strikes.get(row.strike);
           if (!previous) return sum;
 
-          const minutes = entry.lookbackMs / 60000;
+          const minutes = (marketState.timestamp - entry.snapshot.timestamp) / 60000;
           const callVelocity = this.calculateSideOiVelocity(row.call.oi, previous.callOi, minutes);
           const putVelocity = this.calculateSideOiVelocity(row.put.oi, previous.putOi, minutes);
           const callScore = this.scoreVelocitySide("call", row.call, callVelocity);
@@ -460,7 +481,7 @@
       const rawForecastScore = scoreScore + spotTrendScore + alignedTrendBonus + buildUpScore;
       const forecastScore = this.clamp(Math.round(rawForecastScore), -100, 100);
       const confidence = Math.abs(forecastScore);
-      const hasLongerHistory = readyTrends.some((row) => row.lookbackMs >= 10 * 60 * 1000);
+      const hasLongerHistory = readyTrends.some((row) => row.ageMs >= 8 * 60 * 1000);
 
       if (!hasLongerHistory && confidence < 65) {
         return {
@@ -624,6 +645,99 @@
         detail: trend.hasEnoughHistory ? "Choppy / Conflicting Data" : "Collecting Trend History",
         color: "#d97706"
       };
+    }
+
+    marketKey(state) {
+      return state.marketKey || `${state.underlyingKey || state.stockName || "chain"}|${state.expiry || ""}`;
+    }
+
+    assessData(state) {
+      const required = ["ltp", "ltpChangePct", "oi", "oiChg", "volume"];
+      const validRows = (state.strikes || []).filter((row) => [row.call, row.put].every((side) =>
+        side && required.every((key) => Number.isFinite(side[key])) && side.ltp > 0 && side.oi >= 0 && side.volume >= 0));
+      const issues = [];
+      if (!(state.spotPrice > 0)) issues.push("Waiting for the selected chain's spot price");
+      if (validRows.length < 3) issues.push("Need at least 3 paired strikes with price, OI, changes and volume");
+      if (Number.isFinite(state.dataUpdatedAt) && state.timestamp - state.dataUpdatedAt > 30000) issues.push("Data unchanged for over 30 seconds; waiting for a fresh quote");
+      if (state.hasObservedChange === false) issues.push("Waiting for a live price/OI update");
+      if (state.expiry && state.expiry < new Date(state.timestamp + 19800000).toISOString().slice(0, 10)) issues.push("Selected expiry has passed");
+      if (state.sessionOpen === false) issues.unshift("Outside the regular trading session");
+      if (state.sessionOpen !== undefined && !state.expiry) issues.unshift("Select an expiry before using trade signals");
+      const warnings = [];
+      if (!state.expiry) warnings.push("Expiry unavailable");
+      if (!Number.isFinite(state.indiaVix)) warnings.push("India VIX unavailable");
+      if (!Number.isFinite(state.maxPain)) warnings.push("Max pain unavailable");
+      return { ready: !issues.length, issues, warnings, validRows: validRows.length,
+        loadedRows: (state.strikes || []).length,
+        score: Math.round(100 * validRows.length / Math.max(1, (state.strikes || []).length)) };
+    }
+
+    oiLevel(state, side) {
+      const rows = state.strikes.filter((row) => Number.isFinite(row[side].oi)
+        && (side === "put" ? row.strike <= state.spotPrice : row.strike >= state.spotPrice));
+      const best = rows.reduce((best, row) => !best || row[side].oi > best[side].oi ? row : best, null);
+      return best ? { strike: best.strike, oi: best[side].oi } : null;
+    }
+
+    scoreFastMomentum(state, history) {
+      const prior = history.filter((row) => state.timestamp - row.timestamp >= 30000 && state.timestamp - row.timestamp <= 75000).at(-1);
+      if (!prior || !(prior.spotPrice > 0)) return 0;
+      const move = (state.spotPrice / prior.spotPrice - 1) * 100;
+      const vix = state.indiaVix > 0 ? state.indiaVix : 15;
+      const threshold = Math.max(0.02, vix / 500);
+      let score = this.clamp(move / threshold, -1, 1) * 16;
+      const oldRows = new Map(prior.strikes.map((row) => [row.strike, row]));
+      let confirming = 0, comparable = 0;
+      for (const row of state.strikes) {
+        if (Math.abs(row.strike - state.spotPrice) > this.estimateStrikeStep(state.strikes) * 3) continue;
+        const old = oldRows.get(row.strike);
+        if (!old) continue;
+        for (const side of ["call", "put"]) {
+          const current = row[side], previous = old[side];
+          if (!(previous.ltp > 0) || !Number.isFinite(previous.oi) || !Number.isFinite(current.oi)) continue;
+          comparable++;
+          const direction = side === "call" ? 1 : -1;
+          if (current.ltp > previous.ltp && current.oi > previous.oi && current.volume > previous.volume) confirming += direction;
+        }
+      }
+      if (comparable) score += this.clamp(confirming / comparable * 2, -1, 1) * 12;
+      return Math.round(score);
+    }
+
+    selectCandidate(state, side) {
+      const step = this.estimateStrikeStep(state.strikes);
+      const candidates = [];
+      for (const row of state.strikes) {
+        const quote = row[side];
+        if (!quote || !(quote.ltp > 0.05) || !(quote.oi > 0) || !(quote.volume > 0)
+          || Math.abs(row.strike - state.spotPrice) > step * 3) continue;
+        if (Number.isFinite(quote.delta) && (Math.abs(quote.delta) < 0.15 || Math.abs(quote.delta) > 0.9 || Math.sign(quote.delta) !== (side === "call" ? 1 : -1))) continue;
+        if (Number.isFinite(quote.iv) && (quote.iv <= 0 || quote.iv >= 300)) continue;
+        if (Number.isFinite(quote.theta) && Math.abs(quote.theta) > quote.ltp * 5) continue;
+        if ((Number.isFinite(quote.gamma) && quote.gamma < 0) || (Number.isFinite(quote.vega) && quote.vega < 0)) continue;
+        if ((Number.isFinite(quote.askQty) && quote.askQty <= 0) || (Number.isFinite(quote.bidQty) && quote.bidQty <= 0)) continue;
+        let spreadPct = NaN;
+        if (Number.isFinite(quote.bidPrice) && Number.isFinite(quote.askPrice)) {
+          if (!(quote.bidPrice > 0) || quote.askPrice < quote.bidPrice) continue;
+          spreadPct = (quote.askPrice - quote.bidPrice) / ((quote.askPrice + quote.bidPrice) / 2) * 100;
+          if (spreadPct > 10) continue;
+        }
+        const warnings = ["delta", "iv", "theta", "gamma", "vega"].filter((key) => !Number.isFinite(quote[key])).map((key) => `${key} unavailable`);
+        if (!Number.isFinite(spreadPct)) warnings.push("Bid/ask spread unavailable");
+        const thetaCostPct = Number.isFinite(quote.theta) ? Math.abs(quote.theta) / quote.ltp * 100 : NaN;
+        const rank = Math.abs(row.strike - state.spotPrice) / step
+          + (Number.isFinite(quote.delta) ? Math.abs(Math.abs(quote.delta) - 0.5) * 2 : 1)
+          + (Number.isFinite(spreadPct) ? spreadPct / 10 : 0.5);
+        const move = state.spotPrice * 0.01;
+        const sensitivity = {
+          deltaForOnePercent: Number.isFinite(quote.delta) ? quote.delta * move : NaN,
+          gammaForOnePercent: Number.isFinite(quote.gamma) ? 0.5 * quote.gamma * move * move : NaN,
+          vegaPerVolPoint: quote.vega,
+          thetaPerDay: quote.theta
+        };
+        candidates.push({ ...quote, side, strike: row.strike, spreadPct, thetaCostPct, sensitivity, warnings, rank });
+      }
+      return candidates.sort((a, b) => a.rank - b.rank || b.volume - a.volume)[0] || null;
     }
 
     estimateStrikeStep(strikes) {

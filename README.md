@@ -1,52 +1,38 @@
-# Upstox Option Chain Signal Engine
+# Upstox Option Chain Signals
 
-Chrome Extension MV3 for `https://pro.upstox.com/option-chain/*`.
+Chrome MV3 extension for the Upstox Pro option-chain page. It provides heuristic **BUY CALL**, **BUY PUT**, or **WAIT** signals, with a nearby contract candidate and the reasons behind the decision. Scores are rule strength, not probabilities or a validated prediction of profit.
 
-## Files
+## Load or update
 
-- `manifest.json` registers the content scripts.
-- `OptionSignalEngine.js` contains the trend-aware score engine.
-- `content.js` scrapes the Upstox DOM every 10 seconds, keeps 30 minutes of local history, updates one fixed overlay, shows in-page buy-signal alerts, saves the latest score for the popup, and records 5-minute signal outcomes.
-- `background.js` sends Chrome notifications when the signal changes to `BUY CALL` or `BUY PUT`.
-- `popup.html`, `popup.css`, and `popup.js` provide the extension popup notification setting.
-- `icon-128.png` is used for the extension and notification icon.
-- `option-chain-sample.html` is the local DOM reference used to map Upstox row cells.
+1. Open `chrome://extensions`, enable Developer mode, and load this project folder (or click **Reload** for an existing installation).
+2. Refresh Upstox and select an option chain and expiry.
+3. Wait for an actual spot, premium, OI, or volume change. Open the extension popup and use **Test notification** to check desktop alerts.
 
-## Scraped Metrics
+## Data read by content.js
 
-For each of the 10 nearest strike rows, the extension captures `strike`, plus call and put `ltp`, `oiChg`, `oiChgPct`, `volume`, `iv`, `delta`, `gamma`, and `vega`.
+- All strike rows currently loaded in the DOM, plus matching recently captured network rows. The former nearest-10-row limit is removed.
+- Selected underlying, spot, expiry, max pain and India VIX.
+- Calls and puts: LTP, daily price change, total OI, OI change and percentage, volume, IV, delta, gamma, theta and vega.
+- Bid/ask prices, quantities, previous close and previous OI when provided by captured responses.
 
-The signal engine scores directional buildup, PCR context, 5-minute spot trend, spot confirmation, max pain, IV skew, gamma wall support/resistance, and vega/IV skew.
+Headers determine the column mapping; OI labelled in lakhs is converted into units. Missing values remain missing, and valid zero values are preserved. Responses from another underlying or expiry are rejected. Network supplements expire after 15 seconds. History is isolated by underlying and expiry.
 
-It also creates a separate 10-20 minute bias forecast using current signal strength, option-chain buildup, and 5/10/15-minute spot trends:
+Coverage means **loaded/captured rows**, not a guarantee of every exchange strike. Virtualized off-screen rows and unsupported binary WebSocket messages are unavailable unless a matching JSON response supplies them. The extension does not scroll the page, place orders, or request broker credentials.
 
-- `10-20m Bullish Bias`: upside continuation is favored.
-- `10-20m Bearish Bias`: downside continuation is favored.
-- `10-20m Sideways / Wait`: no clean continuation edge.
-- `10-20m Forecast Warming Up`: the extension needs more local history.
+## Calculation and speed
 
-The score and forecast confidence are signal-strength readings, not probabilities. `Strength 100/100` or `Confidence 100/100` means the available rules are fully aligned, not that the trade is guaranteed.
+DOM changes schedule a check within 250 ms, with a one-second backup while the tab is running. Browsers may throttle background tabs. Network responses are processed as they arrive; an early-response replay connects capture to the content script.
 
-## Local Outcome Tracking
+Directional evidence combines ATM-weighted price/OI buildup, actual total-OI PCR, volume PCR, spot confirmation, OI velocity, and observed price/OI/volume changes over roughly 30–60 seconds. Longer trends and the existing 10–20 minute bias estimate need local history. Thresholds remain +50 for calls and -50 for puts.
 
-When a new `BUY CALL` or `BUY PUT` signal appears, the extension stores it locally and checks it after 5 minutes:
+Greeks describe exposure and contract suitability rather than guaranteed direction. Candidate selection checks proximity, traded volume, OI, delta, IV, theta, and available bid/ask spread/depth. Gamma/vega sensitivity, max pain, VIX and OI concentration levels remain available as context. Unavailable Greeks or bid/ask data are identified; known extreme or unusable candidate values are rejected. Arbitrary fixed stop-loss/target prices have been removed; displayed LTP is not an executable entry quote.
 
-- `hit`: spot moved in the signal direction by at least 0.05% or 5 points.
-- `miss`: spot moved against the signal by at least 0.05% or 5 points.
-- `flat`: spot did not move enough either way.
+The overlay shows loaded rows, core-data coverage, score, candidate, OI PCR, OI concentration support/resistance, reasons and the last observed data-change time. WAIT explains insufficient core data, missing expiry, no eligible candidate, unchanged data for over 30 seconds, or being outside the regular weekday equity derivatives session. The regular session guard uses 09:15–15:40 IST from August 2026 (15:30 before); it is not a holiday or special-session calendar. An observed live change is required before alerts.
 
-The popup shows the latest signal score, strength, forecast confidence, hit rate, checked signals, pending signals, and the latest checked result. This data stays in local Chrome storage and can be cleared from the popup.
+Active eligible signals repeat after two minutes. There is no separate sell/exit signal. Local five-minute outcome tracking measures underlying direction, not option profitability, slippage, costs or fill quality.
 
-## Load in Chrome
+## Verification
 
-1. Open `chrome://extensions`.
-2. Enable Developer mode.
-3. Click Load unpacked.
-4. Select this project folder.
-5. Open an Upstox option-chain page.
+Run `node --test tests/*.test.cjs`. Tests cover extraction/units, official nested payloads, capture/replay, bullish/bearish/neutral conditions, data quality, fast momentum, expiry isolation, update scheduling, stale-data suppression and notification responses. These tests do not establish trading performance; live Upstox behavior still depends on its current DOM/feed and browser permissions.
 
-The overlay refreshes every 10 seconds and shows the option-chain stock/index name, derived index label, `BUY CALL`, `BUY PUT`, or `NEUTRAL / WAIT`, signal strength, 10-20 minute forecast, 5/10/15-minute spot trend, update time, and refresh interval.
-
-Chrome also sends a desktop notification when the signal enters or changes to `BUY CALL` or `BUY PUT`. If the same buy signal stays active, the extension repeats the alert every 2 minutes and also shows an in-page signal toast for 8 seconds.
-
-Use the extension toolbar popup to turn buy signal notifications on or off.
+Data schema reference: [Upstox option-chain response](https://upstox.com/developer/api-documentation/get-pc-option-chain/). Greek interpretation: [OIC volatility and Greeks](https://prd-web.optionseducation.org/advancedconcepts/volatility-the-greeks). Session reference: [NSE market timings](https://www.nseindia.com/static/market-data/market-timings).

@@ -116,6 +116,26 @@ input[role="switch"]:focus-visible {
   min-height: 16px;
 }
 
+.notification-test {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.notification-test .status:empty {
+  display: none;
+}
+
+.notification-test .status[data-state="error"] {
+  color: #b91c1c;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
 .score-card,
 .stats {
   display: flex;

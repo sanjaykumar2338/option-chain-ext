@@ -6,6 +6,8 @@
   const LATEST_SIGNAL_STORAGE_KEY = "latestSignalSnapshot";
   const toggle = document.getElementById("notificationsToggle");
   const status = document.getElementById("status");
+  const testNotification = document.getElementById("testNotification");
+  const notificationTestStatus = document.getElementById("notificationTestStatus");
   const scoreStock = document.getElementById("scoreStock");
   const scoreSignal = document.getElementById("scoreSignal");
   const currentStrength = document.getElementById("currentStrength");
@@ -33,6 +35,35 @@
     chrome.storage.sync.set({ [NOTIFICATIONS_ENABLED_KEY]: enabled }, () => {
       setStatus(enabled);
     });
+  });
+
+  testNotification.addEventListener("click", () => {
+    testNotification.disabled = true;
+    notificationTestStatus.innerText = "Testing desktop notifications...";
+    notificationTestStatus.dataset.state = "pending";
+
+    const finishTest = (message, state) => {
+      testNotification.disabled = false;
+      notificationTestStatus.innerText = message;
+      notificationTestStatus.dataset.state = state;
+    };
+
+    try {
+      chrome.runtime.sendMessage({ type: "UPSTOX_OPTION_SIGNAL_TEST" }, (result) => {
+        const error = chrome.runtime.lastError;
+        if (error) {
+          finishTest(`Could not test notifications: ${error.message}`, "error");
+          return;
+        }
+        if (!result?.ok) {
+          finishTest(result?.error || "The notification service did not respond. Reload the extension and try again.", "error");
+          return;
+        }
+        finishTest("Chrome accepted the test notification. If it did not appear, check your system notification settings.", "success");
+      });
+    } catch (error) {
+      finishTest(`Could not test notifications: ${error.message}`, "error");
+    }
   });
 
   function formatRate(hits, misses) {
@@ -83,7 +114,7 @@
       ? `5m spot ${formatSignedPercent(snapshot.spotChangePct5m)}`
       : "trend collecting";
     scoreDetail.innerText =
-      `${snapshot.forecastLabel || "Forecast warming up"} | ${trendText} | ` +
+      `${snapshot.signalDetail || ""} | ${snapshot.dataQuality?.loadedRows ?? "--"} loaded strikes | OI PCR ${Number.isFinite(snapshot.metrics?.pcrOi) ? snapshot.metrics.pcrOi.toFixed(2) : "--"} | ${trendText} | ` +
       `Updated ${formatTime(snapshot.updatedAt)}`;
   }
 

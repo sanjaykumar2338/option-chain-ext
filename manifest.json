@@ -3,7 +3,10 @@
   "name": "Upstox Option Chain Signal Engine",
   "version": "1.0.0",
   "description": "Scrapes Upstox Pro option-chain data and overlays a quantitative call/put signal.",
-  "permissions": ["notifications", "storage"],
+  "permissions": [
+    "notifications",
+    "storage"
+  ],
   "action": {
     "default_popup": "popup.html",
     "default_title": "Upstox Option Signals",
@@ -19,14 +22,23 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://pro.upstox.com/option-chain/*"],
-      "js": ["networkInterceptor.js"],
+      "matches": [
+        "https://pro.upstox.com/*"
+      ],
+      "js": [
+        "networkInterceptor.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN"
     },
     {
-      "matches": ["https://pro.upstox.com/option-chain/*"],
-      "js": ["OptionSignalEngine.js", "content.js"],
+      "matches": [
+        "https://pro.upstox.com/*"
+      ],
+      "js": [
+        "OptionSignalEngine.js",
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
   ]
