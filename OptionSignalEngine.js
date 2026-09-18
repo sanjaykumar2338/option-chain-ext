@@ -160,7 +160,7 @@
     getLookbackState(currentState, history, targetLookbackMs) {
       const eligible = history.filter((state) => {
         const ageMs = currentState.timestamp - state.timestamp;
-        return ageMs >= Math.min(targetLookbackMs * 0.8, TREND_LOOKBACK_MS * 0.8) && ageMs <= targetLookbackMs + 15000;
+        return ageMs >= Math.max(MIN_TREND_AGE_MS, targetLookbackMs - 15000) && ageMs <= targetLookbackMs + 15000;
       });
 
       if (!eligible.length) return null;
@@ -716,6 +716,8 @@
         if (Number.isFinite(quote.theta) && Math.abs(quote.theta) > quote.ltp * 5) continue;
         if ((Number.isFinite(quote.gamma) && quote.gamma < 0) || (Number.isFinite(quote.vega) && quote.vega < 0)) continue;
         if ((Number.isFinite(quote.askQty) && quote.askQty <= 0) || (Number.isFinite(quote.bidQty) && quote.bidQty <= 0)) continue;
+        if ((Number.isFinite(quote.bidPrice) && quote.bidPrice <= 0)
+          || (Number.isFinite(quote.askPrice) && quote.askPrice <= 0)) continue;
         let spreadPct = NaN;
         if (Number.isFinite(quote.bidPrice) && Number.isFinite(quote.askPrice)) {
           if (!(quote.bidPrice > 0) || quote.askPrice < quote.bidPrice) continue;

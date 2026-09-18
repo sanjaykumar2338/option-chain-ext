@@ -23,11 +23,13 @@ Coverage means **loaded/captured rows**, not a guarantee of every exchange strik
 
 DOM changes schedule a check within 250 ms, with a one-second backup while the tab is running. Browsers may throttle background tabs. Network responses are processed as they arrive; an early-response replay connects capture to the content script.
 
-Directional evidence combines ATM-weighted price/OI buildup, actual total-OI PCR, volume PCR, spot confirmation, OI velocity, and observed price/OI/volume changes over roughly 30–60 seconds. Longer trends and the existing 10–20 minute bias estimate need local history. Thresholds remain +50 for calls and -50 for puts.
+Directional evidence combines ATM-weighted price/OI buildup, actual total-OI PCR, volume PCR, spot confirmation, OI velocity, and observed price/OI/volume changes over roughly 30–60 seconds. Each 5/10/15-minute trend requires a sample within 15 seconds of that actual horizon. Longer trends and the existing 10–20 minute bias estimate need local history. Thresholds remain +50 for calls and -50 for puts.
 
 Greeks describe exposure and contract suitability rather than guaranteed direction. Candidate selection checks proximity, traded volume, OI, delta, IV, theta, and available bid/ask spread/depth. Gamma/vega sensitivity, max pain, VIX and OI concentration levels remain available as context. Unavailable Greeks or bid/ask data are identified; known extreme or unusable candidate values are rejected. Arbitrary fixed stop-loss/target prices have been removed; displayed LTP is not an executable entry quote.
 
 The overlay shows loaded rows, core-data coverage, score, candidate, OI PCR, OI concentration support/resistance, reasons and the last observed data-change time. WAIT explains insufficient core data, missing expiry, no eligible candidate, unchanged data for over 30 seconds, or being outside the regular weekday equity derivatives session. The regular session guard uses 09:15–15:40 IST from August 2026 (15:30 before); it is not a holiday or special-session calendar. An observed live change is required before alerts.
+
+The popup independently changes an old BUY reading to WAIT after 30 seconds without fresh data, even when the page stops updating. Known zero or negative bid/ask prices disqualify a candidate even when the other quote side is missing.
 
 Active eligible signals repeat after two minutes. There is no separate sell/exit signal. Local five-minute outcome tracking measures underlying direction, not option profitability, slippage, costs or fill quality.
 

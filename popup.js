@@ -86,7 +86,10 @@
     return `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
   }
 
+  let latestSnapshot = null;
+
   function renderLatestSignal(snapshot) {
+    latestSnapshot = snapshot;
     if (!snapshot) {
       scoreStock.innerText = "Open an option-chain page";
       scoreSignal.innerText = "--";
@@ -98,8 +101,17 @@
     }
 
     scoreStock.innerText = `${snapshot.stockName || "Option Chain"} | ${snapshot.indexName || "--"}`;
-    scoreSignal.innerText = snapshot.signalLabel || "--";
-    scoreSignal.dataset.signal = snapshot.signalKey || "neutral";
+    const stale = !Number.isFinite(snapshot.updatedAt) || Date.now() - snapshot.updatedAt > 30000
+      || (Number.isFinite(snapshot.dataUpdatedAt) && Date.now() - snapshot.dataUpdatedAt > 30000);
+    scoreSignal.innerText = stale ? "WAIT — stale data" : snapshot.signalLabel || "--";
+    scoreSignal.dataset.signal = stale ? "neutral" : snapshot.signalKey || "neutral";
+    if (stale) {
+      currentStrength.innerText = "--";
+      currentScore.innerText = "--";
+      forecastConfidence.innerText = "--";
+      scoreDetail.innerText = `No recent data. Open or refresh the option-chain page. Last checked ${formatTime(snapshot.updatedAt)}.`;
+      return;
+    }
     currentStrength.innerText = Number.isFinite(snapshot.strength)
       ? `${snapshot.strength}/100`
       : "--";
@@ -178,4 +190,5 @@
 
   loadLatestSignal();
   loadBacktestStats();
+  window.setInterval(() => renderLatestSignal(latestSnapshot), 1000);
 })();

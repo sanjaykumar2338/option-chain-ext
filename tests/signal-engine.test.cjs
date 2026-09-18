@@ -100,3 +100,24 @@ test("one-minute OI lookback tolerates timer jitter", () => {
   engine.analyze(state);
   assert.ok(engine.getOiLookbackSnapshot({ ...state, timestamp: state.timestamp + 61000 }, 60000));
 });
+
+test("each trend horizon requires history near its actual duration", () => {
+  const engine = new OptionSignalEngine();
+  const current = marketState("bullish");
+  const fourMinutesAgo = { ...current, timestamp: current.timestamp - 240000, spotPrice: 24900 };
+  for (const minutes of [5, 10, 15]) {
+    assert.equal(engine.calculateSpotTrendForLookback(current, [fourMinutesAgo], minutes * 60000).hasEnoughHistory, false);
+    const accurate = { ...fourMinutesAgo, timestamp: current.timestamp - minutes * 60000 + 5000 };
+    assert.equal(engine.calculateSpotTrendForLookback(current, [accurate], minutes * 60000).hasEnoughHistory, true);
+  }
+});
+
+test("one-sided zero bid or ask prevents a contract recommendation", () => {
+  for (const patch of [{ bidPrice: 0 }, { askPrice: 0 }, { bidPrice: -1 }]) {
+    const state = marketState("bullish");
+    state.strikes.forEach(row => Object.assign(row.call, patch));
+    const result = new OptionSignalEngine().analyze(state);
+    assert.equal(result.signal.key, "neutral");
+    assert.equal(result.candidate, null);
+  }
+});
