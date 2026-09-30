@@ -112,6 +112,7 @@ function createHarness({ stockName = "NIFTY", spot = 25000, centre = 25000,
     MutationObserver: class {
       constructor(callback) { observer = callback; }
       observe() {}
+      disconnect() {}
     },
     console: { warn: (...args) => warnings.push(args) },
     chrome: {
@@ -125,7 +126,7 @@ function createHarness({ stockName = "NIFTY", spot = 25000, centre = 25000,
           if (values.latestSignalSnapshot) snapshots.push(values.latestSignalSnapshot);
         }
       } },
-      runtime: { sendMessage(message, callback) {
+      runtime: { id: "test-extension", sendMessage(message, callback) {
         notifications.push({ ...message, at: now });
         callback({ ok: true });
       } }
@@ -136,10 +137,17 @@ function createHarness({ stockName = "NIFTY", spot = 25000, centre = 25000,
 
   return {
     snapshots,
+    setVisibility(hidden) {
+      document.hidden = hidden;
+      listeners.get("document:visibilitychange")?.();
+    },
     setSpot(value) { spotNode.innerText = `Spot ${value}`; observer([{ target: spotNode, addedNodes: [] }]); },
     setTime(value) { for (const timer of timers.values()) timer.time += value - now; now = value; },
     notifications,
     warnings,
+    get signalHistory() { return stored.signalHistory || []; },
+    get evaluationLog() { return stored.signalEvaluationLog || []; },
+    invalidateExtensionContext() { context.chrome.runtime.id = undefined; },
     get latest() { return stored.latestSignalSnapshot; },
     readOverlay(role) {
       return elementsById.get("upstox-quant-signal-overlay")?.roles.get(role)?.innerText;
@@ -180,6 +188,30 @@ test("one-second heartbeat updates without DOM mutations", () => {
   app.advance(1); assert.equal(app.snapshots.length, 2);
 });
 
+test("an invalidated extension context stops quietly after an extension reload", () => {
+  const app = createHarness();
+  app.invalidateExtensionContext();
+  app.advance(1000);
+  assert.equal(app.warnings.length, 0);
+});
+
+test("network updates are processed while the option-chain tab is inactive", () => {
+  const app = createHarness();
+  app.setVisibility(true);
+  app.emitNetwork({
+    data: [{
+      strike_price: 25100,
+      underlying_key: "NSE_INDEX|Nifty 50",
+      expiry: "2026-09-24",
+      underlying_spot_price: 25001,
+      call_options: { market_data: { ltp: 100, oi: 10000, volume: 1000 } },
+      put_options: { market_data: { ltp: 100, oi: 20000, volume: 1000 } }
+    }]
+  });
+  assert.equal(app.latest.dataQuality.loadedRows, 4);
+  assert.equal(app.snapshots.length, 2);
+});
+
 test("initial data waits for a live change; fresh bullish data alerts", () => {
   const app = createHarness();
   assert.equal(app.notifications.length, 0);
@@ -188,6 +220,11 @@ test("initial data waits for a live change; fresh bullish data alerts", () => {
   assert.equal(app.latest.signalLabel, "BUY CALL");
   assert.equal(app.latest.candidate.side, "call");
   assert.equal(app.notifications.length, 1);
+  assert.equal(app.signalHistory.length, 1);
+  assert.equal(app.signalHistory[0].stockName, "NIFTY");
+  assert.equal(app.signalHistory[0].signalLabel, "BUY CALL");
+  assert.ok(Number.isFinite(app.signalHistory[0].signalTime));
+  assert.ok(app.evaluationLog.some((record) => record.signalKey === "call"));
   assert.equal(app.latest.dataQuality.validRows, 3);
 });
 

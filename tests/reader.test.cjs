@@ -41,6 +41,31 @@ test('header mapping handles reordered columns and refuses mismatched layouts', 
   headers.pop(); assert.ok(Number.isNaN(context.parseOptionRow(row, 'call').ltp));
 });
 
+test('duplicate Upstox OI headers map to total and change in mirrored chain order', () => {
+  function makeRow(headers, cells) {
+    return {
+      querySelectorAll: () => cells.map(innerText => ({ innerText })),
+      closest: () => ({ querySelectorAll: () => headers.map(innerText => ({ innerText })) })
+    };
+  }
+
+  const call = context.parseOptionRow(makeRow(
+    ['Volume', 'IV', 'Delta', 'OI', 'OI', 'LTP'],
+    ['2L', '15', '0.5', '+7,460', '0.30 L', '100 +5%']
+  ), 'call');
+  assert.equal(call.oiChg, 7460);
+  assert.equal(call.oi, 30000);
+  assert.equal(call.ltp, 100);
+
+  const put = context.parseOptionRow(makeRow(
+    ['LTP', 'OI', 'OI', 'Delta', 'IV', 'Volume'],
+    ['110 -5%', '0.40 L', '+8,250', '-0.5', '16', '3L']
+  ), 'put');
+  assert.equal(put.oi, 40000);
+  assert.equal(put.oiChg, 8250);
+  assert.equal(put.ltp, 110);
+});
+
 test('supplement never replaces valid zero and expiry date validates', () => {
   const merged = context.mergeSide({ oiChg: 0, theta: NaN }, { oiChg: 100, theta: -2 });
   assert.equal(merged.oiChg, 0); assert.equal(merged.theta, -2);

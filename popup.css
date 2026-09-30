@@ -227,3 +227,31 @@ button:focus-visible {
 .latest {
   min-height: 32px;
 }
+
+.history-link {
+  display: block;
+  padding: 10px 12px;
+  border: 1px solid #c7d2fe;
+  border-radius: 8px;
+  color: #3730a3;
+  background: #eef2ff;
+  font-size: 12px;
+  font-weight: 700;
+  text-align: center;
+  text-decoration: none;
+}
+
+.history-link:hover {
+  background: #e0e7ff;
+}
+
+.diagnostics-link {
+  margin-top: -8px;
+  border-color: #bae6fd;
+  color: #075985;
+  background: #f0f9ff;
+}
+
+.diagnostics-link:hover {
+  background: #e0f2fe;
+}

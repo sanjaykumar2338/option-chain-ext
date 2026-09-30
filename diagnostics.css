@@ -1,0 +1,30 @@
+* { box-sizing: border-box; }
+body { margin: 0; color: #111827; background: #f3f4f6; font-family: Inter, system-ui, sans-serif; }
+main { width: min(1280px, calc(100% - 32px)); margin: 24px auto; }
+header, .section-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+header { margin-bottom: 18px; }
+h1, h2, h3, p { margin-top: 0; }
+h1 { margin-bottom: 4px; font-size: 24px; } h2 { margin-bottom: 3px; font-size: 17px; } h3 { margin: 18px 0 8px; font-size: 13px; }
+p { margin-bottom: 0; color: #6b7280; font-size: 12px; }
+.actions, .filters { display: flex; gap: 10px; }
+button, input, select { min-height: 36px; border: 1px solid #d1d5db; border-radius: 7px; background: #fff; font: inherit; }
+button { padding: 0 13px; cursor: pointer; } button.danger { color: #b91c1c; }
+.panel { margin-bottom: 18px; padding: 16px; border: 1px solid #e5e7eb; border-radius: 10px; background: #fff; }
+.badge { padding: 5px 9px; border-radius: 999px; color: #fff; background: #64748b; font-size: 12px; }
+.badge.call { background: #0f9f6e; } .badge.put { background: #dc2626; } .badge.neutral { background: #d97706; }
+.health-grid, .factor-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; margin-top: 14px; }
+.health-grid div, .factor-grid div { padding: 9px; border-radius: 7px; background: #f9fafb; }
+.health-grid strong, .factor-grid strong { display: block; font-size: 15px; }
+.health-grid small, .factor-grid small { color: #6b7280; }
+.positive { color: #047857; } .negative { color: #b91c1c; }
+.issues { margin-top: 12px; color: #92400e; }
+.filters { align-items: flex-end; margin: 14px 0; }
+label { display: flex; flex-direction: column; gap: 5px; color: #4b5563; font-size: 12px; font-weight: 700; }
+input { width: 240px; padding: 0 10px; } select { padding: 0 28px 0 10px; }
+.table-wrap { overflow-x: auto; border: 1px solid #e5e7eb; border-radius: 8px; }
+table { width: 100%; border-collapse: collapse; white-space: nowrap; }
+th, td { padding: 9px 10px; border-bottom: 1px solid #e5e7eb; text-align: left; font-size: 11px; }
+th { color: #4b5563; background: #f9fafb; text-transform: uppercase; } tr:last-child td { border-bottom: 0; }
+.result-hit { color: #047857; font-weight: 800; } .result-miss { color: #b91c1c; font-weight: 800; } .result-flat { color: #92400e; font-weight: 800; }
+.empty { padding: 36px; text-align: center; }
+@media (max-width: 700px) { header { flex-direction: column; } .filters { flex-wrap: wrap; } }

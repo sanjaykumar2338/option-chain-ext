@@ -15,9 +15,15 @@
   const MARKET_HISTORY_WINDOW_MS = 30 * 60 * 1000;
   const SIGNAL_EVALUATION_HORIZON_MS = 5 * 60 * 1000;
   const BACKTEST_STORAGE_KEY = "signalBacktests";
+  const SIGNAL_HISTORY_STORAGE_KEY = "signalHistory";
+  const EVALUATION_LOG_STORAGE_KEY = "signalEvaluationLog";
   const LATEST_SIGNAL_STORAGE_KEY = "latestSignalSnapshot";
   const OVERLAY_POSITION_STORAGE_KEY = "signalOverlayPosition";
   const BACKTEST_MAX_RECORDS = 100;
+  const SIGNAL_HISTORY_MAX_RECORDS = 2000;
+  const EVALUATION_LOG_MAX_RECORDS = 3000;
+  const EVALUATION_SAMPLE_MS = 60 * 1000;
+  const EVALUATION_HORIZONS_MS = [5, 10, 15, 20].map((minutes) => minutes * 60 * 1000);
   const OVERLAY_ID = "upstox-quant-signal-overlay";
   const SIGNAL_TOAST_ID = "upstox-quant-signal-toast";
   const SIGNAL_NOTIFICATION_TYPE = "UPSTOX_OPTION_SIGNAL";
@@ -31,6 +37,39 @@
   };
   let fallbackTimer = null;
   let signalToastTimer = null;
+  let heartbeatTimer = null;
+  let domObserver = null;
+  let stopped = false;
+  let evaluationRecords = null;
+  let evaluationLoadPending = false;
+  let evaluationLoadCallbacks = [];
+
+  function isContextInvalidationError(error) {
+    const text = [error?.name, error?.message, error?.stack, String(error || "")]
+      .filter(Boolean).join(" ");
+    return /(extension context|context invalidated|message port closed)/i.test(text);
+  }
+
+  function hasValidExtensionContext() {
+    try {
+      return Boolean(globalThis.chrome?.runtime?.id);
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function stopInvalidatedContext() {
+    if (stopped) return;
+    stopped = true;
+    window.clearTimeout(fallbackTimer);
+    window.clearTimeout(signalToastTimer);
+    window.clearInterval(heartbeatTimer);
+    domObserver?.disconnect();
+    window.removeEventListener?.(NETWORK_EVENT_NAME, handleNetworkPayload);
+    window.removeEventListener?.("focus", scheduleFallbackDomCycle);
+    document.removeEventListener?.("visibilitychange", handleVisibilityChange);
+    document.removeEventListener?.("change", scheduleFallbackDomCycle);
+  }
 
   function normalizeNumericText(value) {
     return String(value ?? "").replace(/[\u2212\u2013\u2014]/g, "-")
@@ -271,6 +310,17 @@
       // A changed/hidden column must never shift unrelated values into Greeks.
       if (headers.length !== cells.length) return result;
       fields = headers.map(columnField);
+      // Upstox currently labels both total OI and change in OI as "OI".
+      // Their order is mirrored between the two halves of the chain.
+      const oiColumns = fields.reduce((indices, field, index) => {
+        if (field === "oi") indices.push(index);
+        return indices;
+      }, []);
+      if (oiColumns.length === 2 && !fields.includes("oiChg")) {
+        const [firstOi, secondOi] = oiColumns;
+        fields[firstOi] = side === "call" ? "oiChg" : "oi";
+        fields[secondOi] = side === "call" ? "oi" : "oiChg";
+      }
       if (!fields.includes("ltp") || new Set(fields.filter(Boolean)).size !== fields.filter(Boolean).length) return result;
     } else {
       // Only the observed ten-column Upstox layout has a fixed-index fallback.
@@ -853,11 +903,15 @@
   }
 
   function saveLatestSignalSnapshot(result) {
+    if (!hasValidExtensionContext()) {
+      stopInvalidatedContext();
+      return;
+    }
     const storage = globalThis.chrome?.storage?.local;
     if (!storage) return;
 
     const risk = getRiskMatrix(result);
-    storage.set({
+    try { storage.set({
       [LATEST_SIGNAL_STORAGE_KEY]: {
         stockName: result.marketState.stockName,
         indexName: result.marketState.indexName,
@@ -878,6 +932,7 @@
         dataQuality: result.dataQuality,
         reasons: result.reasons,
         blockers: result.blockers,
+        factors: result.factors,
         metrics: result.metrics,
         candidate: result.candidate,
         dataUpdatedAt: result.marketState.dataUpdatedAt,
@@ -885,7 +940,10 @@
         hasTrendHistory: result.trend.hasEnoughHistory,
         updatedAt: result.marketState.timestamp
       }
-    });
+    }); } catch (error) {
+      if (isContextInvalidationError(error)) stopInvalidatedContext();
+      else throw error;
+    }
   }
 
   function isBuySignal(result) {
@@ -893,29 +951,174 @@
   }
 
   function getSignalBacktests(callback) {
+    if (!hasValidExtensionContext()) {
+      stopInvalidatedContext();
+      callback([]);
+      return;
+    }
     const storage = globalThis.chrome?.storage?.local;
     if (!storage) {
       callback([]);
       return;
     }
 
-    storage.get({ [BACKTEST_STORAGE_KEY]: [] }, (data) => {
+    try { storage.get({ [BACKTEST_STORAGE_KEY]: [] }, (data) => {
       const records = Array.isArray(data[BACKTEST_STORAGE_KEY]) ? data[BACKTEST_STORAGE_KEY] : [];
       callback(records);
-    });
+    }); } catch (error) {
+      if (isContextInvalidationError(error)) stopInvalidatedContext();
+      else throw error;
+    }
   }
 
   function saveSignalBacktests(records) {
+    if (!hasValidExtensionContext()) {
+      stopInvalidatedContext();
+      return;
+    }
     const storage = globalThis.chrome?.storage?.local;
     if (!storage) return;
 
-    storage.set({
+    try { storage.set({
       [BACKTEST_STORAGE_KEY]: records.slice(-BACKTEST_MAX_RECORDS)
-    });
+    }); } catch (error) {
+      if (isContextInvalidationError(error)) stopInvalidatedContext();
+      else throw error;
+    }
   }
 
   function getOutcomeThreshold(spotPrice) {
     return Math.max(5, spotPrice * 0.0005);
+  }
+
+  function loadEvaluationRecords(callback) {
+    if (evaluationRecords) {
+      callback(evaluationRecords);
+      return;
+    }
+    evaluationLoadCallbacks.push(callback);
+    if (evaluationLoadPending || !hasValidExtensionContext()) return;
+    evaluationLoadPending = true;
+    try {
+      chrome.storage.local.get({ [EVALUATION_LOG_STORAGE_KEY]: [] }, (data) => {
+        evaluationLoadPending = false;
+        evaluationRecords = Array.isArray(data[EVALUATION_LOG_STORAGE_KEY])
+          ? data[EVALUATION_LOG_STORAGE_KEY]
+          : [];
+        const callbacks = evaluationLoadCallbacks;
+        evaluationLoadCallbacks = [];
+        callbacks.forEach((queued) => queued(evaluationRecords));
+      });
+    } catch (error) {
+      evaluationLoadPending = false;
+      evaluationLoadCallbacks = [];
+      if (isContextInvalidationError(error) || !hasValidExtensionContext()) stopInvalidatedContext();
+      else throw error;
+    }
+  }
+
+  function saveEvaluationRecords() {
+    if (!evaluationRecords || !hasValidExtensionContext()) return;
+    evaluationRecords = evaluationRecords.slice(-EVALUATION_LOG_MAX_RECORDS);
+    try {
+      chrome.storage.local.set({ [EVALUATION_LOG_STORAGE_KEY]: evaluationRecords });
+    } catch (error) {
+      if (isContextInvalidationError(error) || !hasValidExtensionContext()) stopInvalidatedContext();
+      else throw error;
+    }
+  }
+
+  function optionExitPrice(marketState, record) {
+    const row = marketState.strikes.find((item) => item.strike === record.candidateStrike);
+    const quote = row?.[record.candidateSide];
+    return quote?.bidPrice > 0 ? quote.bidPrice : quote?.ltp;
+  }
+
+  function updateEvaluationLog(result) {
+    loadEvaluationRecords(() => {
+      if (stopped) return;
+      const state = result.marketState;
+      const marketKey = engine.marketKey(state);
+      let changed = false;
+
+      evaluationRecords = evaluationRecords.map((record) => {
+        if (record.marketKey !== marketKey) return record;
+        const outcomes = { ...(record.outcomes || {}) };
+        let recordChanged = false;
+        for (const horizonMs of EVALUATION_HORIZONS_MS) {
+          const minutes = String(horizonMs / 60000);
+          if (outcomes[minutes] || state.timestamp - record.time < horizonMs) continue;
+          const spotMove = state.spotPrice - record.spotPrice;
+          const direction = record.signalKey === "call" ? 1 : record.signalKey === "put" ? -1 : 0;
+          const directionalMove = spotMove * direction;
+          const threshold = getOutcomeThreshold(record.spotPrice);
+          const exitOptionPrice = optionExitPrice(state, record);
+          const optionPnl = Number.isFinite(record.entryOptionPrice) && Number.isFinite(exitOptionPrice)
+            ? exitOptionPrice - record.entryOptionPrice
+            : NaN;
+          outcomes[minutes] = {
+            time: state.timestamp,
+            spotPrice: state.spotPrice,
+            spotMove,
+            spotMovePct: record.spotPrice ? spotMove / record.spotPrice * 100 : 0,
+            result: direction === 0 ? "observed"
+              : directionalMove > threshold ? "hit"
+                : directionalMove < -threshold ? "miss" : "flat",
+            exitOptionPrice,
+            optionReturnPct: Number.isFinite(optionPnl) && record.entryOptionPrice > 0
+              ? optionPnl / record.entryOptionPrice * 100
+              : NaN
+          };
+          recordChanged = true;
+        }
+        if (recordChanged) changed = true;
+        return recordChanged ? { ...record, outcomes } : record;
+      });
+
+      const bucket = Math.floor(state.timestamp / EVALUATION_SAMPLE_MS);
+      const id = `${marketKey}|${bucket}|${result.signal.key}`;
+      if (!evaluationRecords.some((record) => record.id === id)) {
+        const candidate = result.candidate;
+        evaluationRecords.push({
+          id,
+          time: state.timestamp,
+          marketKey,
+          stockName: state.stockName,
+          indexName: state.indexName,
+          expiry: state.expiry,
+          source: state.source,
+          signalKey: result.signal.key,
+          signalLabel: result.signal.label,
+          signalDetail: result.signal.detail,
+          score: result.totalScore,
+          strength: result.strength,
+          spotPrice: state.spotPrice,
+          dataUpdatedAt: state.dataUpdatedAt,
+          factors: result.factors,
+          blockers: result.blockers,
+          dataQuality: {
+            ready: result.dataQuality.ready,
+            score: result.dataQuality.score,
+            loadedRows: result.dataQuality.loadedRows,
+            validRows: result.dataQuality.validRows,
+            issues: result.dataQuality.issues,
+            warnings: result.dataQuality.warnings
+          },
+          metrics: {
+            pcrOi: result.metrics.pcrOi,
+            pcrVolume: result.metrics.pcrVolume,
+            support: result.metrics.support,
+            resistance: result.metrics.resistance
+          },
+          candidateStrike: candidate?.strike,
+          candidateSide: candidate?.side,
+          entryOptionPrice: candidate?.askPrice > 0 ? candidate.askPrice : candidate?.ltp,
+          outcomes: {}
+        });
+        changed = true;
+      }
+      if (changed) saveEvaluationRecords();
+    });
   }
 
   function recordSignalBacktest(result) {
@@ -936,6 +1139,11 @@
       entrySpot: result.marketState.spotPrice,
       entryTime: result.marketState.timestamp,
       strength: result.strength,
+      factors: result.factors,
+      candidateStrike: result.candidate?.strike,
+      entryOptionPrice: result.candidate?.askPrice > 0
+        ? result.candidate.askPrice
+        : result.candidate?.ltp,
       horizonMs: SIGNAL_EVALUATION_HORIZON_MS
     };
 
@@ -943,6 +1151,63 @@
       if (records.some((existing) => existing.id === record.id)) return;
       saveSignalBacktests(records.concat(record));
     });
+  }
+
+  function recordSignalHistory(result) {
+    if (!hasValidExtensionContext()) {
+      stopInvalidatedContext();
+      return;
+    }
+    const storage = globalThis.chrome?.storage?.local;
+    if (!storage) return;
+    const candidate = result.candidate;
+    const record = {
+      id: [result.marketState.timestamp, result.signal.key, result.marketState.stockName].join("-"),
+      stockName: result.marketState.stockName,
+      indexName: result.marketState.indexName,
+      expiry: result.marketState.expiry,
+      marketKey: engine.marketKey(result.marketState),
+      signalKey: result.signal.key,
+      signalLabel: result.signal.label,
+      signalDetail: result.signal.detail,
+      signalTime: result.marketState.timestamp,
+      spotPrice: result.marketState.spotPrice,
+      score: result.totalScore,
+      strength: result.strength,
+      forecastLabel: result.forecast.label,
+      forecastConfidence: result.forecast.confidence,
+      candidate: candidate ? {
+        strike: candidate.strike,
+        side: candidate.side,
+        ltp: candidate.ltp,
+        bidPrice: candidate.bidPrice,
+        askPrice: candidate.askPrice,
+        spreadPct: candidate.spreadPct,
+        delta: candidate.delta,
+        iv: candidate.iv
+      } : null,
+      factors: result.factors,
+      reasons: result.reasons
+    };
+
+    try { storage.get({ [SIGNAL_HISTORY_STORAGE_KEY]: [] }, (data) => {
+      if (!hasValidExtensionContext()) return;
+      const records = Array.isArray(data[SIGNAL_HISTORY_STORAGE_KEY])
+        ? data[SIGNAL_HISTORY_STORAGE_KEY]
+        : [];
+      if (records.some((existing) => existing.id === record.id)) return;
+      try {
+        storage.set({
+          [SIGNAL_HISTORY_STORAGE_KEY]: records.concat(record).slice(-SIGNAL_HISTORY_MAX_RECORDS)
+        });
+      } catch (error) {
+        if (isContextInvalidationError(error)) stopInvalidatedContext();
+        else throw error;
+      }
+    }); } catch (error) {
+      if (isContextInvalidationError(error)) stopInvalidatedContext();
+      else throw error;
+    }
   }
 
   function evaluatePendingSignals(marketState) {
@@ -970,6 +1235,12 @@
           : directionalMove < -threshold
             ? "miss"
             : "flat";
+        const optionRow = marketState.strikes.find((row) => row.strike === record.candidateStrike);
+        const exitQuote = optionRow?.[record.signalKey];
+        const exitOptionPrice = exitQuote?.bidPrice > 0 ? exitQuote.bidPrice : exitQuote?.ltp;
+        const optionPnl = Number.isFinite(record.entryOptionPrice) && Number.isFinite(exitOptionPrice)
+          ? exitOptionPrice - record.entryOptionPrice
+          : NaN;
 
         changed = true;
         return {
@@ -977,6 +1248,11 @@
           status,
           exitSpot: marketState.spotPrice,
           exitTime: marketState.timestamp,
+          exitOptionPrice,
+          optionPnl,
+          optionReturnPct: Number.isFinite(optionPnl) && record.entryOptionPrice > 0
+            ? optionPnl / record.entryOptionPrice * 100
+            : NaN,
           spotMove,
           spotMovePct: record.entrySpot ? (spotMove / record.entrySpot) * 100 : 0,
           threshold
@@ -988,11 +1264,15 @@
   }
 
   function sendSignalNotification(result) {
+    if (!hasValidExtensionContext()) {
+      stopInvalidatedContext();
+      return;
+    }
     const trendText = result.trend.hasEnoughHistory
       ? `5m spot ${formatSignedPercent(result.trend.spotChangePct)}`
       : "trend warming up";
 
-    chrome.runtime.sendMessage({
+    try { chrome.runtime.sendMessage({
       type: SIGNAL_NOTIFICATION_TYPE,
       signalKey: result.signal.key,
       signalLabel: result.signal.label,
@@ -1000,13 +1280,25 @@
       detail: `${result.signal.detail}. Strength ${result.strength}/100. ${result.forecast.label}${result.forecast.key === "warming" ? "" : ` ${result.forecast.confidence}/100`}. ${trendText}.`,
       meta: result.marketState.indexName
     }, (response) => {
-      const lastError = chrome.runtime.lastError;
-      if (lastError) {
-        console.warn("[Upstox Quant Signal] Notification send failed", lastError.message);
-      } else if (response?.ok === false && response.reason !== "disabled") {
-        console.warn("[Upstox Quant Signal] Notification failed", response.error);
+      try {
+        if (!hasValidExtensionContext()) {
+          stopInvalidatedContext();
+          return;
+        }
+        const lastError = chrome.runtime.lastError;
+        if (lastError) {
+          if (isContextInvalidationError(lastError)) stopInvalidatedContext();
+          else console.warn("[Upstox Quant Signal] Notification send failed", lastError.message);
+        } else if (response?.ok === false && response.reason !== "disabled") {
+          console.warn("[Upstox Quant Signal] Notification failed", response.error);
+        }
+      } catch (error) {
+        if (isContextInvalidationError(error) || !hasValidExtensionContext()) stopInvalidatedContext();
       }
-    });
+    }); } catch (error) {
+      if (isContextInvalidationError(error) || !hasValidExtensionContext()) stopInvalidatedContext();
+      else console.warn("[Upstox Quant Signal] Notification send failed", error);
+    }
   }
 
   function handleSignalTransition(result) {
@@ -1026,6 +1318,7 @@
 
     if (signalChanged) {
       recordSignalBacktest(result);
+      recordSignalHistory(result);
       playSignalAudioCue(result.signal.key);
     }
 
@@ -1050,9 +1343,18 @@
     lastSignalKey = null;
     const toast = document.getElementById(SIGNAL_TOAST_ID);
     if (toast) toast.style.display = "none";
-    globalThis.chrome?.storage?.local?.set({ [LATEST_SIGNAL_STORAGE_KEY]: {
-      stockName, signalKey: "neutral", signalLabel: "WAITING", signalDetail: message, updatedAt: Date.now()
-    } });
+    if (!hasValidExtensionContext()) {
+      stopInvalidatedContext();
+      return;
+    }
+    try {
+      globalThis.chrome?.storage?.local?.set({ [LATEST_SIGNAL_STORAGE_KEY]: {
+        stockName, signalKey: "neutral", signalLabel: "WAITING", signalDetail: message, updatedAt: Date.now()
+      } });
+    } catch (error) {
+      if (isContextInvalidationError(error) || !hasValidExtensionContext()) stopInvalidatedContext();
+      else throw error;
+    }
   }
 
   let freshness = null;
@@ -1090,6 +1392,10 @@
 
   function processMarketState(marketState) {
     try {
+      if (stopped || !hasValidExtensionContext()) {
+        stopInvalidatedContext();
+        return;
+      }
       if (!isOptionChainPage()) return;
       stampDataStatus(marketState);
       if (!marketState.strikes.length) {
@@ -1104,11 +1410,16 @@
       const history = getHistoryForMarket(marketState);
       const result = engine.analyze(marketState, history);
       rememberMarketState(result.marketState);
+      updateEvaluationLog(result);
       evaluatePendingSignals(result.marketState);
       saveLatestSignalSnapshot(result);
       updateOverlay(result);
       handleSignalTransition(result);
     } catch (error) {
+      if (isContextInvalidationError(error) || !hasValidExtensionContext()) {
+        stopInvalidatedContext();
+        return;
+      }
       console.warn("[Upstox Quant Signal] Cycle failed", error);
       updateOverlayError("Temporary Upstox DOM refresh");
     }
@@ -1118,6 +1429,10 @@
     window.clearTimeout(fallbackTimer);
     fallbackTimer = null;
     try {
+      if (stopped || !hasValidExtensionContext()) {
+        stopInvalidatedContext();
+        return;
+      }
       if (!isOptionChainPage()) {
         document.getElementById(OVERLAY_ID)?.remove();
         document.getElementById(SIGNAL_TOAST_ID)?.remove();
@@ -1126,12 +1441,17 @@
       }
       processMarketState(scrapeMarketState());
     } catch (error) {
+      if (isContextInvalidationError(error) || !hasValidExtensionContext()) {
+        stopInvalidatedContext();
+        return;
+      }
       console.warn("[Upstox Quant Signal] DOM read failed", error);
       updateOverlayError("Waiting for option-chain data to refresh");
     }
   }
 
   function scheduleFallbackDomCycle() {
+    if (stopped) return;
     // Do not postpone an already scheduled check on each incoming quote.
     if (fallbackTimer !== null) return;
     fallbackTimer = window.setTimeout(runFallbackDomCycle, FALLBACK_THROTTLE_MS);
@@ -1144,13 +1464,17 @@
       if (!marketState?.strikes.length) return;
       processMarketState(marketState);
     } catch (error) {
+      if (isContextInvalidationError(error) || !hasValidExtensionContext()) {
+        stopInvalidatedContext();
+        return;
+      }
       console.warn("[Upstox Quant Signal] Network payload ignored", error);
       scheduleFallbackDomCycle();
     }
   }
 
   function installDomFallbackObserver() {
-    const observer = new MutationObserver((mutations) => {
+    domObserver = new MutationObserver((mutations) => {
       const hasOptionChainMutation = mutations.some((mutation) => {
         const targetElement = mutation.target?.nodeType === Node.ELEMENT_NODE
           ? mutation.target
@@ -1169,21 +1493,23 @@
       if (hasOptionChainMutation) scheduleFallbackDomCycle();
     });
 
-    observer.observe(document.documentElement, {
+    domObserver.observe(document.documentElement, {
       childList: true,
       characterData: true,
       subtree: true
     });
   }
 
+  function handleVisibilityChange() {
+    if (!document.hidden) scheduleFallbackDomCycle();
+  }
+
   window.addEventListener(NETWORK_EVENT_NAME, handleNetworkPayload);
   window.addEventListener("focus", scheduleFallbackDomCycle);
-  document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) scheduleFallbackDomCycle();
-  });
+  document.addEventListener("visibilitychange", handleVisibilityChange);
   document.addEventListener("change", scheduleFallbackDomCycle);
   installDomFallbackObserver();
   window.dispatchEvent(new CustomEvent("upstox-option-chain-request-latest"));
   runFallbackDomCycle();
-  window.setInterval(runFallbackDomCycle, DOM_REFRESH_INTERVAL_MS);
+  heartbeatTimer = window.setInterval(runFallbackDomCycle, DOM_REFRESH_INTERVAL_MS);
 })();

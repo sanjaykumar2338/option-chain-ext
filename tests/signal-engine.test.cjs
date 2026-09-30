@@ -3,6 +3,8 @@ const { test } = require("node:test");
 
 require("../OptionSignalEngine.js");
 
+const clone = (value) => JSON.parse(JSON.stringify(value));
+
 function marketState(direction) {
   const bullish = direction === "bullish";
   const bearish = direction === "bearish";
@@ -92,6 +94,63 @@ test("thirty-second changes contribute fast momentum without mixing expiries", (
   assert.ok(result.factors.fastMomentum > 0);
   const other = new OptionSignalEngine().analyze({ ...current, expiry: "2026-10-01" }, [previous]);
   assert.equal(other.factors.fastMomentum, 0);
+});
+
+test("delta-weighted new option flow confirms bullish and bearish pressure", () => {
+  const engine = new OptionSignalEngine();
+  const previous = marketState("conflicting");
+  previous.strikes.forEach((row) => {
+    Object.assign(row.call, { ltp: 100, bidPrice: 99, askPrice: 101, delta: 0.5, volume: 1000, oi: 10000 });
+    Object.assign(row.put, { ltp: 100, bidPrice: 99, askPrice: 101, delta: -0.5, volume: 1000, oi: 10000 });
+  });
+
+  const moved = (direction) => {
+    const state = clone(previous);
+    state.timestamp += 31000;
+    state.strikes.forEach((row) => {
+      const callMove = direction === "bullish" ? 5 : -5;
+      const putMove = -callMove;
+      Object.assign(row.call, { ltp: 100 + callMove, bidPrice: 99 + callMove, askPrice: 101 + callMove, volume: 1200, oi: 10100 });
+      Object.assign(row.put, { ltp: 100 + putMove, bidPrice: 99 + putMove, askPrice: 101 + putMove, volume: 1200, oi: 10100 });
+    });
+    return engine.normalizeMarketState(state);
+  };
+  const normalizedPrevious = engine.normalizeMarketState(previous);
+  assert.equal(engine.scoreDeltaWeightedFlow(moved("bullish"), [normalizedPrevious]), 24);
+  assert.equal(engine.scoreDeltaWeightedFlow(moved("bearish"), [normalizedPrevious]), -24);
+});
+
+test("PCR adapts to the instrument's rolling baseline", () => {
+  const engine = new OptionSignalEngine();
+  const baseline = marketState("conflicting");
+  baseline.strikes.forEach((row) => { row.call.oi = 10000; row.put.oi = 10000; });
+  const history = Array.from({ length: 5 }, (_, index) => engine.normalizeMarketState({
+    ...clone(baseline), timestamp: baseline.timestamp - (5 - index) * 10000
+  }));
+  const current = clone(baseline);
+  current.strikes.forEach((row) => {
+    row.put.oi = 11500;
+    row.put.ltpChangePct = -1;
+    row.call.ltpChangePct = 1;
+  });
+  const score = engine.scorePcrContext(engine.normalizeMarketState(current), { hasEnoughHistory: false }, history);
+  assert.equal(score, 14);
+});
+
+test("rising comparable put IV skew is bearish", () => {
+  const engine = new OptionSignalEngine();
+  const previous = marketState("conflicting");
+  previous.strikes.forEach((row) => {
+    Object.assign(row.call, { delta: 0.25, iv: 15 });
+    Object.assign(row.put, { delta: -0.25, iv: 15 });
+  });
+  const current = clone(previous);
+  current.timestamp += 31000;
+  current.strikes.forEach((row) => { row.put.iv = 17; });
+  assert.equal(engine.scoreIvSkewChange(
+    engine.normalizeMarketState(current),
+    [engine.normalizeMarketState(previous)]
+  ), -10);
 });
 
 test("one-minute OI lookback tolerates timer jitter", () => {

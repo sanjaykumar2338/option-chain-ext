@@ -32,8 +32,10 @@
       const factors = {
         directionalBuildUp,
         oiVelocity,
+        optionFlow: this.scoreDeltaWeightedFlow(normalizedMarketState, normalizedHistory),
         fastMomentum: this.scoreFastMomentum(normalizedMarketState, normalizedHistory),
-        pcrContext: this.scorePcrContext(normalizedMarketState, trend),
+        pcrContext: this.scorePcrContext(normalizedMarketState, trend, normalizedHistory),
+        ivSkewChange: this.scoreIvSkewChange(normalizedMarketState, normalizedHistory),
         spotTrend: this.scoreSpotTrend(trend),
         spotConfirmation: this.scoreSpotConfirmation(directionalBuildUp, trend),
         maxPain: 0,
@@ -290,17 +292,31 @@
       return 0;
     }
 
-    scorePcrContext(marketState, trend) {
+    scorePcrContext(marketState, trend, history = []) {
       const metrics = this.calculateMarketMetrics(marketState);
       const pcr = Number.isFinite(metrics.pcrOi) ? metrics.pcrOi : metrics.pcrVolume;
 
       if (!Number.isFinite(pcr)) return 0;
 
       let score = 0;
+      const historicalPcr = history.map((state) => {
+        const historicalMetrics = this.calculateMarketMetrics(state);
+        return Number.isFinite(historicalMetrics.pcrOi) ? historicalMetrics.pcrOi : historicalMetrics.pcrVolume;
+      }).filter(Number.isFinite);
+      let highPcr = pcr >= 1.25;
+      let lowPcr = pcr <= 0.75;
+      if (historicalPcr.length >= 5) {
+        const baseline = this.median(historicalPcr);
+        const mad = this.median(historicalPcr.map((value) => Math.abs(value - baseline)));
+        const scale = Math.max(mad * 1.4826, Math.abs(baseline) * 0.03, 0.03);
+        const normalizedPcr = (pcr - baseline) / scale;
+        highPcr = normalizedPcr >= 1;
+        lowPcr = normalizedPcr <= -1;
+      }
 
-      if (pcr >= 1.25) {
+      if (highPcr) {
         score += metrics.avgPutLtpChange <= 0 ? 14 : -14;
-      } else if (pcr <= 0.75) {
+      } else if (lowPcr) {
         score += metrics.avgCallLtpChange >= 0 ? 14 : -14;
       }
 
@@ -317,6 +333,88 @@
       }
 
       return this.clamp(score, -22, 22);
+    }
+
+    getShortLookbackState(state, history) {
+      return history.filter((row) => {
+        const age = state.timestamp - row.timestamp;
+        return age >= 30000 && age <= 75000;
+      }).at(-1) || null;
+    }
+
+    optionMidPrice(side) {
+      if (side.bidPrice > 0 && side.askPrice >= side.bidPrice) {
+        return (side.bidPrice + side.askPrice) / 2;
+      }
+      return side.ltp > 0 ? side.ltp : NaN;
+    }
+
+    scoreDeltaWeightedFlow(state, history) {
+      const prior = this.getShortLookbackState(state, history);
+      if (!prior) return 0;
+
+      const oldRows = new Map(prior.strikes.map((row) => [row.strike, row]));
+      const step = this.estimateStrikeStep(state.strikes);
+      const sigma = Math.max(step * 2, 1);
+      let pressure = 0;
+      let totalWeight = 0;
+
+      for (const row of state.strikes) {
+        if (Math.abs(row.strike - state.spotPrice) > step * 3) continue;
+        const old = oldRows.get(row.strike);
+        if (!old) continue;
+        const atmWeight = this.calculateGaussianAtmWeight(row.strike, state.spotPrice, sigma);
+
+        for (const sideName of ["call", "put"]) {
+          const current = row[sideName];
+          const previous = old[sideName];
+          if (!Number.isFinite(current.delta) || !Number.isFinite(previous.volume)) continue;
+          const volumeChange = Math.max(0, current.volume - previous.volume);
+          const oiChange = Number.isFinite(current.oi) && Number.isFinite(previous.oi)
+            ? Math.abs(current.oi - previous.oi)
+            : 0;
+          const currentMid = this.optionMidPrice(current);
+          const previousMid = this.optionMidPrice(previous);
+          const priceDirection = Math.sign(currentMid - previousMid);
+          if (!priceDirection || (!volumeChange && !oiChange)) continue;
+
+          let liquidityWeight = 1;
+          if (current.bidPrice > 0 && current.askPrice >= current.bidPrice) {
+            const spreadPct = (current.askPrice - current.bidPrice) / currentMid * 100;
+            liquidityWeight = this.clamp(1 - spreadPct / 10, 0.1, 1);
+          }
+          const activity = Math.log1p(volumeChange) + Math.log1p(oiChange) * 0.5;
+          const weight = Math.abs(current.delta) * activity * atmWeight * liquidityWeight;
+          pressure += Math.sign(current.delta) * priceDirection * weight;
+          totalWeight += weight;
+        }
+      }
+
+      return totalWeight ? Math.round(this.clamp(pressure / totalWeight, -1, 1) * 24) : 0;
+    }
+
+    calculateComparableIvSkew(state) {
+      const calls = [];
+      const puts = [];
+      for (const row of state.strikes) {
+        if (row.strike >= state.spotPrice && Number.isFinite(row.call.iv)
+          && Math.abs(row.call.delta) >= 0.15 && Math.abs(row.call.delta) <= 0.4) calls.push(row.call);
+        if (row.strike <= state.spotPrice && Number.isFinite(row.put.iv)
+          && Math.abs(row.put.delta) >= 0.15 && Math.abs(row.put.delta) <= 0.4) puts.push(row.put);
+      }
+      const callIv = this.average(calls.map((side) => side.iv));
+      const putIv = this.average(puts.map((side) => side.iv));
+      return Number.isFinite(callIv) && Number.isFinite(putIv) ? putIv - callIv : NaN;
+    }
+
+    scoreIvSkewChange(state, history) {
+      const prior = this.getShortLookbackState(state, history);
+      if (!prior) return 0;
+      const currentSkew = this.calculateComparableIvSkew(state);
+      const previousSkew = this.calculateComparableIvSkew(prior);
+      if (!Number.isFinite(currentSkew) || !Number.isFinite(previousSkew)) return 0;
+      // Rapidly increasing OTM put IV relative to call IV confirms downside risk.
+      return Math.round(this.clamp(-(currentSkew - previousSkew) / 1.5, -1, 1) * 10);
     }
 
     scoreSpotTrend(trend) {

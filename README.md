@@ -21,9 +21,9 @@ Coverage means **loaded/captured rows**, not a guarantee of every exchange strik
 
 ## Calculation and speed
 
-DOM changes schedule a check within 250 ms, with a one-second backup while the tab is running. Browsers may throttle background tabs. Network responses are processed as they arrive; an early-response replay connects capture to the content script.
+DOM changes schedule a check within 250 ms, with a one-second backup while the tab is running. Network responses are processed as they arrive even when the option-chain tab is inactive; an early-response replay connects capture to the content script. Chrome may throttle timers or freeze/discard a background tab, and the extension cannot read new page data while the tab is frozen, discarded, closed, the computer is asleep, or Upstox has stopped its feed.
 
-Directional evidence combines ATM-weighted price/OI buildup, actual total-OI PCR, volume PCR, spot confirmation, OI velocity, and observed price/OI/volume changes over roughly 30–60 seconds. Each 5/10/15-minute trend requires a sample within 15 seconds of that actual horizon. Longer trends and the existing 10–20 minute bias estimate need local history. Thresholds remain +50 for calls and -50 for puts.
+Directional evidence combines ATM-weighted price/OI buildup, delta-weighted new option flow, adaptive total-OI/volume PCR, IV-skew change, spot confirmation, OI velocity, and observed price/OI/volume changes over roughly 30–60 seconds. The adaptive PCR uses the selected instrument's rolling median once at least five observations exist; fixed thresholds are only the warm-up fallback. Each 5/10/15-minute trend requires a sample within 15 seconds of that actual horizon. Longer trends and the existing 10–20 minute bias estimate need local history. Thresholds remain +50 for calls and -50 for puts.
 
 Greeks describe exposure and contract suitability rather than guaranteed direction. Candidate selection checks proximity, traded volume, OI, delta, IV, theta, and available bid/ask spread/depth. Gamma/vega sensitivity, max pain, VIX and OI concentration levels remain available as context. Unavailable Greeks or bid/ask data are identified; known extreme or unusable candidate values are rejected. Arbitrary fixed stop-loss/target prices have been removed; displayed LTP is not an executable entry quote.
 
@@ -31,7 +31,11 @@ The overlay shows loaded rows, core-data coverage, score, candidate, OI PCR, OI 
 
 The popup independently changes an old BUY reading to WAIT after 30 seconds without fresh data, even when the page stops updating. Known zero or negative bid/ask prices disqualify a candidate even when the other quote side is missing.
 
-Active eligible signals repeat after two minutes. There is no separate sell/exit signal. Local five-minute outcome tracking measures underlying direction, not option profitability, slippage, costs or fill quality.
+Active eligible signals repeat after two minutes. There is no separate sell/exit signal. Local five-minute outcome tracking measures underlying direction and, when the matching quote remains available, records a conservative option result from entry ask to exit bid/LTP. It does not include brokerage, taxes or guaranteed fills.
+
+The popup links to a local signal-history page. New BUY CALL and BUY PUT transitions are stored in Chrome local storage with the instrument, expiry, signal time, score, spot price, selected contract and factor details. The most recent 2,000 records are retained and can be filtered or exported as a JSON file.
+
+The diagnostics link shows the current factor contributions, data coverage, freshness, PCR and blockers. It also keeps up to 3,000 compact evaluation samples for CALL, PUT and WAIT decisions, sampled at most once per decision per instrument per minute. Each sample is updated with 5/10/15/20-minute spot outcomes and an option return estimate when a matching candidate quote is available. Evaluation data can be exported as JSON for walk-forward analysis.
 
 ## Verification
 

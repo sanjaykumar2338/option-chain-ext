@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Option Signal Diagnostics</title>
+    <link rel="stylesheet" href="diagnostics.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div><h1>Signal diagnostics</h1><p id="summary">Loading evaluation data…</p></div>
+        <div class="actions"><button id="downloadJson">Download evaluations</button><button id="clearLog" class="danger">Clear log</button></div>
+      </header>
+
+      <section class="panel">
+        <div class="section-title"><div><h2>Current evaluation</h2><p id="currentMeta">Waiting for an option-chain update.</p></div><strong id="currentSignal" class="badge">--</strong></div>
+        <div id="healthGrid" class="health-grid"></div>
+        <h3>Factor contributions</h3>
+        <div id="factorGrid" class="factor-grid"></div>
+        <p id="currentIssues" class="issues"></p>
+      </section>
+
+      <section class="panel">
+        <div class="section-title"><div><h2>Evaluation log</h2><p>One sample per instrument per minute; outcomes update after 5, 10, 15 and 20 minutes.</p></div></div>
+        <div class="filters">
+          <label>Instrument <input id="instrumentFilter" type="search" placeholder="NIFTY, SENSEX…"></label>
+          <label>Decision <select id="signalFilter"><option value="">All</option><option value="call">BUY CALL</option><option value="put">BUY PUT</option><option value="neutral">WAIT</option></select></label>
+        </div>
+        <div class="table-wrap"><table><thead><tr><th>Time</th><th>Instrument</th><th>Decision</th><th>Score</th><th>Rows</th><th>Fresh</th><th>5m</th><th>10m</th><th>15m</th><th>20m</th></tr></thead><tbody id="evaluationRows"></tbody></table><p id="emptyState" class="empty" hidden>No evaluations match these filters.</p></div>
+      </section>
+    </main>
+    <script src="diagnostics.js"></script>
+  </body>
+</html>

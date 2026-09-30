@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Option Signal History</title>
+    <link rel="stylesheet" href="signal-history.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>Signal history</h1>
+          <p id="summary">Loading locally stored signals…</p>
+        </div>
+        <div class="actions">
+          <button id="downloadJson" type="button">Download JSON</button>
+          <button id="clearHistory" class="danger" type="button">Clear history</button>
+        </div>
+      </header>
+
+      <div class="filters">
+        <label>Instrument <input id="instrumentFilter" type="search" placeholder="NIFTY, BANKNIFTY…"></label>
+        <label>Signal
+          <select id="signalFilter">
+            <option value="">All</option>
+            <option value="call">BUY CALL</option>
+            <option value="put">BUY PUT</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Time</th><th>Instrument</th><th>Expiry</th><th>Signal</th><th>Score</th><th>Spot</th><th>Contract</th><th>Price</th></tr></thead>
+          <tbody id="historyRows"></tbody>
+        </table>
+        <p id="emptyState" class="empty" hidden>No stored signals match these filters.</p>
+      </div>
+    </main>
+    <script src="signal-history.js"></script>
+  </body>
+</html>
