@@ -28,28 +28,7 @@
   const SIGNAL_TOAST_ID = "upstox-quant-signal-toast";
   const SIGNAL_NOTIFICATION_TYPE = "UPSTOX_OPTION_SIGNAL";
   const engine = new OptionSignalEngine();
-  const scannedDepth = new Map();
-  let depthScanStatus = 'Depth scan idle';
-  const depthScanner = new OptionDepthScanner({
-    document,
-    getContext: () => !stopped && hasValidExtensionContext() && isOptionChainPage() ? scrapeMarketState(false) : null,
-    onQuote: (target, quote) => {
-      scannedDepth.set(`${target.marketKey}|${target.strike}|${target.side}`, quote);
-      scheduleFallbackDomCycle();
-    },
-    onStatus: (message, running) => {
-      depthScanStatus = message;
-      const overlay = document.getElementById(OVERLAY_ID);
-      const button = overlay?.querySelector('[data-role="scan-depth"]');
-      if (button) button.innerText = running ? 'Stop depth scan' : 'Scan bid/ask';
-      const status = overlay?.querySelector('[data-role="depth-status"]');
-      if (status) status.innerText = message;
-    },
-    setTimer: (callback, delay) => window.setTimeout(callback, delay),
-    clearTimer: timer => window.clearTimeout(timer)
-  });
   let marketHistory = [];
-  let lastDebugReading = null;
   let lastSignalKey = null;
   let lastNotification = {
     signalKey: null,
@@ -82,7 +61,6 @@
   function stopInvalidatedContext() {
     if (stopped) return;
     stopped = true;
-    depthScanner.stop();
     window.clearTimeout(fallbackTimer);
     window.clearTimeout(signalToastTimer);
     window.clearInterval(heartbeatTimer);
@@ -644,39 +622,6 @@
     if (!marketHistory.length || marketState.timestamp - marketHistory.at(-1).timestamp >= 5000) marketHistory.push(marketState);
   }
 
-  function logOptionChainReading() {
-    if (!isOptionChainPage()) return;
-    const capturedAt = Date.now();
-    const domOnly = scrapeMarketState(false);
-    const rawPageRows = ['left', 'right'].flatMap(side =>
-      Array.from(document.querySelectorAll(`tr[data-id^="${side}TableOCRow"]`)).map(row => ({
-        side: side === 'left' ? 'call' : 'put',
-        strike: getStrikeFromRow(row, side),
-        headers: Array.from(row.closest?.('table')?.querySelectorAll('thead th') || [])
-          .map(header => String(header.innerText ?? header.textContent ?? '').trim()),
-        cells: getCellTexts(row)
-      })));
-    const snapshot = {
-      capturedAt: new Date(capturedAt).toISOString(),
-      note: 'Missing/non-finite numeric values are null. DOM OI labelled in lakhs is converted to units. Raw cells are captured now; lastProcessed is the most recent analysis and may be older. Only loaded/captured rows are included.',
-      depthScanStatus,
-      depthScanDetails: {
-        running: depthScanner.running,
-        current: depthScanner.index || 0,
-        total: depthScanner.queue?.length || 0,
-        captured: depthScanner.captured || 0,
-        skipped: depthScanner.skipped || 0,
-        skippedContracts: depthScanner.skipReasons || []
-      },
-      rawPageRows,
-      domOnly,
-      mergedReadingNow: scrapeMarketState(),
-      lastProcessed: lastDebugReading?.input?.marketKey === domOnly.marketKey ? lastDebugReading : null
-    };
-    // A JSON string freezes the reading; DevTools cannot display later mutated values.
-    console.log('[Upstox data snapshot — copy the JSON below]\n' + JSON.stringify(snapshot, null, 2));
-  }
-
   function createOverlay() {
     let overlay = document.getElementById(OVERLAY_ID);
     if (overlay) return overlay;
@@ -716,19 +661,10 @@
       '<div data-role="signal" style="font-weight:900;font-size:15px;overflow-wrap:anywhere;"></div>',
       '<div data-role="meta" style="opacity:0.92;font-weight:700;overflow-wrap:anywhere;"></div>',
       '<div data-role="forecast" style="opacity:0.95;font-weight:800;overflow-wrap:anywhere;"></div>',
-      '<div data-role="detail" style="opacity:0.78;overflow-wrap:anywhere;"></div>',
-      '<div data-role="depth-status" style="font-size:11px;font-weight:700;"></div>',
-      '<button type="button" data-role="scan-depth" style="pointer-events:auto;align-self:flex-start;padding:5px 9px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;color:#111827;font-weight:700;cursor:pointer;">Scan bid/ask</button>',
-      '<button type="button" data-role="log-data" style="pointer-events:auto;align-self:flex-start;margin-top:6px;padding:5px 9px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;color:#111827;font-weight:700;cursor:pointer;">Log data to console</button>'
+      '<div data-role="detail" style="opacity:0.78;overflow-wrap:anywhere;"></div>'
     ].join("");
 
     document.documentElement.appendChild(overlay);
-    overlay.querySelector('[data-role="log-data"]').addEventListener('click', logOptionChainReading);
-    overlay.querySelector('[data-role="scan-depth"]').addEventListener('click', () => {
-      if (depthScanner.running) depthScanner.stop();
-      else depthScanner.start();
-    });
-    overlay.querySelector('[data-role="depth-status"]').innerText = depthScanStatus;
     restoreOverlayPosition(overlay);
     enableOverlayDrag(overlay);
     return overlay;
@@ -995,6 +931,35 @@
     if (!storage) return;
 
     const risk = getRiskMatrix(result);
+    const optionFields = ["ltp", "oi", "oiChg", "volume", "iv", "delta", "theta", "gamma", "vega"];
+    const fieldCoverage = Object.fromEntries(optionFields.map((field) => [field, 0]));
+    let readableContracts = 0;
+    let completeContracts = 0;
+    let readableCalls = 0;
+    let readablePuts = 0;
+    for (const row of result.marketState.strikes) {
+      for (const sideName of ["call", "put"]) {
+        const side = row[sideName] || {};
+        const presentFields = optionFields.filter((field) => Number.isFinite(side[field]));
+        if (!presentFields.length) continue;
+        readableContracts += 1;
+        if (sideName === "call") readableCalls += 1;
+        else readablePuts += 1;
+        presentFields.forEach((field) => { fieldCoverage[field] += 1; });
+        if (presentFields.length === optionFields.length) completeContracts += 1;
+      }
+    }
+    const optionDataHealth = {
+      healthy: Number.isFinite(result.marketState.spotPrice) && result.marketState.spotPrice > 0
+        && Boolean(result.marketState.expiry) && readableCalls > 0 && readablePuts > 0
+        && optionFields.every((field) => fieldCoverage[field] > 0),
+      loadedStrikes: result.marketState.strikes.length,
+      readableContracts,
+      completeContracts,
+      readableCalls,
+      readablePuts,
+      fieldCoverage
+    };
     try { storage.set({
       [LATEST_SIGNAL_STORAGE_KEY]: {
         stockName: result.marketState.stockName,
@@ -1019,6 +984,7 @@
         expiry: result.marketState.expiry,
         marketKey: engine.marketKey(result.marketState),
         dataQuality: result.dataQuality,
+        optionDataHealth,
         reasons: result.reasons,
         blockers: result.blockers,
         factors: result.factors,
@@ -1537,15 +1503,7 @@
         return;
       }
       if (!isOptionChainPage()) return;
-      for (const [key, quote] of scannedDepth) {
-        if (Date.now() - quote.quoteUpdatedAt > 10000 || !key.startsWith(`${marketState.marketKey}|`)) scannedDepth.delete(key);
-      }
-      for (const row of marketState.strikes) for (const side of ['call', 'put']) {
-        const quote = scannedDepth.get(`${marketState.marketKey}|${row.strike}|${side}`);
-        if (quote && !(row[side]?.bidPrice > 0 && row[side]?.askPrice > 0)) row[side] = { ...row[side], ...quote };
-      }
       stampDataStatus(marketState);
-      lastDebugReading = { input: marketState, analysis: null };
       if (!marketState.strikes.length) {
         updateOverlayError("Option-chain rows not ready", marketState.stockName);
         return;
@@ -1557,9 +1515,6 @@
 
       const history = getHistoryForMarket(marketState);
       const result = engine.analyze(marketState, history);
-      lastDebugReading.analysis = { signal: result.signal, biasSignal: result.biasSignal,
-        totalScore: result.totalScore, factors: result.factors, dataQuality: result.dataQuality,
-        blockers: result.blockers, candidate: result.candidate, entryTiming: result.entryTiming };
       rememberMarketState(result.marketState);
       updateEvaluationLog(result);
       evaluatePendingSignals(result.marketState);
@@ -1652,7 +1607,6 @@
   }
 
   function handleVisibilityChange() {
-    if (document.hidden && depthScanner.running) depthScanner.stop("Depth scan paused: tab hidden");
     if (!document.hidden) scheduleFallbackDomCycle();
   }
 

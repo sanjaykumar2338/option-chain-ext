@@ -8,6 +8,8 @@
   const status = document.getElementById("status");
   const testNotification = document.getElementById("testNotification");
   const notificationTestStatus = document.getElementById("notificationTestStatus");
+  const checkDataHealth = document.getElementById("checkDataHealth");
+  const dataHealthStatus = document.getElementById("dataHealthStatus");
   const scoreStock = document.getElementById("scoreStock");
   const scoreSignal = document.getElementById("scoreSignal");
   const currentStrength = document.getElementById("currentStrength");
@@ -88,6 +90,32 @@
 
   let latestSnapshot = null;
 
+  checkDataHealth.addEventListener("click", () => {
+    const snapshot = latestSnapshot;
+    const health = snapshot?.optionDataHealth;
+    const stale = !Number.isFinite(snapshot?.dataUpdatedAt) || Date.now() - snapshot.dataUpdatedAt > 30000;
+    if (!snapshot || !health) {
+      dataHealthStatus.innerText = "No health data yet. Reload the extension, then open or refresh an Upstox option-chain page.";
+      dataHealthStatus.dataset.state = "error";
+      return;
+    }
+    if (stale) {
+      dataHealthStatus.innerText = `Option data is not live. Last chain update was ${formatTime(snapshot.dataUpdatedAt)}.`;
+      dataHealthStatus.dataset.state = "error";
+      return;
+    }
+    if (health.healthy) {
+      dataHealthStatus.innerText = `Extension is healthy and reading option data successfully: ${health.loadedStrikes} strikes, ${health.readableCalls} calls and ${health.readablePuts} puts. LTP, OI, OI change, volume, IV, delta, theta, gamma and vega are available.`;
+      dataHealthStatus.dataset.state = "success";
+      return;
+    }
+    const missing = Object.entries(health.fieldCoverage || {})
+      .filter(([, count]) => !count)
+      .map(([field]) => field.toUpperCase());
+    dataHealthStatus.innerText = `Option data is incomplete${missing.length ? `: missing ${missing.join(", ")}` : ". Check that calls, puts, spot and expiry are visible"}.`;
+    dataHealthStatus.dataset.state = "error";
+  });
+
   function renderLatestSignal(snapshot) {
     latestSnapshot = snapshot;
     if (!snapshot) {
@@ -105,16 +133,14 @@
       || (Number.isFinite(snapshot.dataUpdatedAt) && Date.now() - snapshot.dataUpdatedAt > 30000);
     const entryExpired = snapshot.entryTiming?.eligible === true && Number.isFinite(snapshot.entryTiming?.setup?.expiresAt)
       && Date.now() >= snapshot.entryTiming.setup.expiresAt;
-    const quoteExpired = snapshot.entryTiming?.setup && (!Number.isFinite(snapshot.candidate?.quoteUpdatedAt)
-      || Date.now() > (snapshot.entryTiming.quoteExpiresAt ?? snapshot.candidate.quoteUpdatedAt + 10000));
-    const entryUnavailable = entryExpired || quoteExpired;
+    const entryUnavailable = entryExpired;
     scoreSignal.innerText = entryUnavailable ? "WAIT — entry expired" : stale ? "WAIT — stale data" : snapshot.signalLabel || "--";
     scoreSignal.dataset.signal = stale || entryUnavailable ? "neutral" : snapshot.signalKey || "neutral";
     if (stale || entryUnavailable) {
       currentStrength.innerText = "--";
       currentScore.innerText = "--";
       forecastConfidence.innerText = "--";
-      scoreDetail.innerText = entryUnavailable ? "Entry window or candidate quote expired. Wait for a fresh confirmed setup." : `No recent data. Open or refresh the option-chain page. Last checked ${formatTime(snapshot.updatedAt)}.`;
+      scoreDetail.innerText = entryUnavailable ? "Entry window expired. Wait for a fresh confirmed setup." : `No recent data. Open or refresh the option-chain page. Last checked ${formatTime(snapshot.updatedAt)}.`;
       return;
     }
     currentStrength.innerText = Number.isFinite(snapshot.strength)

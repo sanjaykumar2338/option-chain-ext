@@ -6,10 +6,6 @@ const path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname, '../content.js'), 'utf8');
 const context = vm.createContext({
   OptionSignalEngine: class {},
-  OptionDepthScanner: class {
-    constructor() {}
-    stop() {}
-  },
   document: {},
   URL
 });

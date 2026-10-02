@@ -134,7 +134,6 @@ function createHarness({ stockName = "NIFTY", spot = 25000, centre = 25000,
     }
   });
   vm.runInContext(engineSource, context, { filename: "OptionSignalEngine.js" });
-  vm.runInContext(fs.readFileSync(path.join(__dirname, '../depthScanner.js'), 'utf8'), context);
   vm.runInContext(contentSource.replace('  function recordSignalHistory(result) {',
     '  globalThis.testRecordSignalHistory = recordSignalHistory;\n  function recordSignalHistory(result) {'), context, { filename: "content.js" });
 
@@ -146,6 +145,10 @@ function createHarness({ stockName = "NIFTY", spot = 25000, centre = 25000,
       listeners.get("document:visibilitychange")?.();
     },
     setSpot(value) { spotNode.innerText = `Spot ${value}`; observer([{ target: spotNode, addedNodes: [] }]); },
+    setCallLtp(value) {
+      leftRows.forEach(row => { row.children[8].innerText = `${value} +5%`; });
+      observer([{ target: leftRows[0], addedNodes: [] }]);
+    },
     setTime(value) { for (const timer of timers.values()) timer.time += value - now; now = value; },
     notifications,
     warnings,
@@ -307,27 +310,18 @@ test('matching network rows supplement the chain; other expiries are rejected', 
   assert.equal(app.latest.dataQuality.loadedRows, 3);
 });
 
-test('spot updates and DOM polling cannot refresh a captured contract quote', () => {
-  const app = createHarness();
-  app.quote();
-  app.setSpot(25001); app.advance(250);
-  const quoteTime = app.latest.candidate.quoteUpdatedAt;
-  app.advance(5000); app.setSpot(25002); app.advance(250);
-  assert.equal(app.latest.candidate.quoteUpdatedAt, quoteTime);
-  app.advance(5000); app.setSpot(25003); app.advance(250);
-  assert.equal(app.latest.signalKey, 'neutral');
-  assert.equal(app.latest.candidate, null);
-  assert.match(app.latest.signalDetail, /fresh bid\/ask/);
-});
-
-test('missing bid/ask data never produces a live BUY despite price movement', () => {
+test('missing bid/ask data does not block a confirmed live BUY', () => {
   const app = createHarness();
   for (let i = 0; i < 6; i++) {
-    app.advance(9750); app.setSpot(25001 + i * 4); app.advance(250);
+    app.advance(9750);
+    app.setCallLtp(101 + i);
+    app.setSpot(25001 + i * 4);
+    app.advance(250);
   }
-  assert.equal(app.notifications.length, 0);
-  assert.equal(app.latest.signalKey, 'neutral');
-  assert.match(app.latest.signalDetail, /fresh bid\/ask/);
+  assert.equal(app.latest.signalKey, 'call');
+  assert.equal(app.latest.candidate.side, 'call');
+  assert.ok(Number.isNaN(app.latest.candidate.bidPrice));
+  assert.equal(app.notifications.length, 1);
 });
 
 test('experimental formula details are saved in snapshots and evaluation exports', () => {

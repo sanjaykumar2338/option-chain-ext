@@ -100,8 +100,8 @@ test("missing core fields and stale data block trade alerts", () => {
   }
 });
 
-test("invalid expiry Greeks and wide spreads cannot become entry candidates", () => {
-  for (const patch of [{ iv: 500 }, { iv: 0 }, { delta: 1 }, { delta: -0.5 }, { theta: -1000 }, { bidPrice: 80, askPrice: 120 }]) {
+test("invalid Greeks cannot become entry candidates", () => {
+  for (const patch of [{ iv: 500 }, { iv: 0 }, { delta: 1 }, { delta: -0.5 }, { theta: -1000 }]) {
     const state = marketState("bullish");
     state.strikes.forEach(row => Object.assign(row.call, patch));
     const result = new OptionSignalEngine().analyze(state);
@@ -202,13 +202,13 @@ test("each trend horizon requires history near its actual duration", () => {
   }
 });
 
-test("one-sided zero bid or ask prevents a contract recommendation", () => {
+test("one-sided zero bid or ask does not block a contract recommendation", () => {
   for (const patch of [{ bidPrice: 0 }, { askPrice: 0 }, { bidPrice: -1 }]) {
     const state = marketState("bullish");
     state.strikes.forEach(row => Object.assign(row.call, patch));
     const result = new OptionSignalEngine().analyze(state);
-    assert.equal(result.signal.key, "neutral");
-    assert.equal(result.candidate, null);
+    assert.equal(result.signal.key, "call");
+    assert.ok(result.candidate);
   }
 });
 
@@ -281,7 +281,7 @@ test('loss of premium confirmation cancels a ready entry', () => {
   assert.equal(tick(42, 11, 100).entryTiming.key, 'invalidated');
 });
 
-test('live candidate requires recent two-sided quotes and a narrow spread', () => {
+test('bid/ask availability and spread do not block an ITM candidate', () => {
   for (const patch of [
     { bidPrice: undefined }, { askPrice: undefined }, { bidPrice: 96, askPrice: 104 },
     { quoteUpdatedAt: undefined }, { quoteUpdatedAt: 989999 }, { quoteUpdatedAt: 1000001 }
@@ -290,16 +290,28 @@ test('live candidate requires recent two-sided quotes and a narrow spread', () =
     state.strikes.forEach(row => Object.assign(row.call, patch));
     const result = new OptionSignalEngine().analyze(state);
     assert.equal(result.signal.key, 'neutral');
-    assert.equal(result.candidate, null);
-    assert.match(result.signal.detail, /fresh bid\/ask/);
+    assert.ok(result.candidate);
+    assert.doesNotMatch(result.signal.detail, /bid\/ask|spread/i);
   }
 });
 
-test('quote quality configuration changes the candidate spread ceiling', () => {
+test('wide spread remains informational and does not change candidate eligibility', () => {
   const state = liveState();
   state.strikes.forEach(row => Object.assign(row.call, { bidPrice: 98, askPrice: 102 }));
-  assert.equal(new OptionSignalEngine().selectCandidate(state, 'call'), null);
-  assert.ok(new OptionSignalEngine({ maxSpreadPct: 5 }).selectCandidate(state, 'call'));
+  const candidate = new OptionSignalEngine().selectCandidate(state, 'call');
+  assert.ok(candidate);
+  assert.ok(candidate.spreadPct > 3);
+});
+
+test('candidate selection uses only the first three ITM strikes', () => {
+  const engine = new OptionSignalEngine();
+  const state = marketState('bullish');
+  assert.deepEqual(engine.getItmStrikes(state, 'call'), [24950, 24900, 24850]);
+  assert.deepEqual(engine.getItmStrikes(state, 'put'), [25050, 25100, 25150]);
+  assert.equal(engine.selectCandidate(state, 'call').strike, 24950);
+  assert.equal(engine.selectCandidate(state, 'put').strike, 25050);
+  state.strikes.find(row => row.strike === 24800).call.volume = 999999999;
+  assert.notEqual(engine.selectCandidate(state, 'call').strike, 24800);
 });
 
 test('switching expiry cannot reuse a pending setup', () => {

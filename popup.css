@@ -116,19 +116,27 @@ input[role="switch"]:focus-visible {
   min-height: 16px;
 }
 
-.notification-test {
+.notification-test,
+.health-check {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
   gap: 8px;
 }
 
-.notification-test .status:empty {
+.notification-test .status:empty,
+.health-check .status:empty {
   display: none;
 }
 
-.notification-test .status[data-state="error"] {
+.notification-test .status[data-state="error"],
+.health-check .status[data-state="error"] {
   color: #b91c1c;
+}
+
+.health-check .status[data-state="success"] {
+  color: #047857;
+  font-weight: 700;
 }
 
 button:disabled {

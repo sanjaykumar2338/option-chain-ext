@@ -12,7 +12,7 @@ function harness(snapshot) {
   const context = vm.createContext({
     Date: class extends Date { static now() { return now; } },
     document: { getElementById(id) {
-      if (!elements.has(id)) elements.set(id, { innerText: '', dataset: {}, addEventListener() {} });
+      if (!elements.has(id)) elements.set(id, { innerText: '', dataset: {}, listeners: {}, addEventListener(event, callback) { this.listeners[event] = callback; } });
       return elements.get(id);
     } },
     window: { setInterval(callback) { tick = callback; } },
@@ -24,6 +24,7 @@ function harness(snapshot) {
   });
   vm.runInContext(source, context);
   return { text: id => elements.get(id).innerText,
+    click(id) { elements.get(id).listeners.click(); },
     advance(ms) { now += ms; tick(); },
     update(snapshot) { changed({ latestSignalSnapshot: { newValue: snapshot } }, 'local'); } };
 }
@@ -68,8 +69,27 @@ test('popup suppresses an expired entry even with fresh chain data', () => {
   assert.match(app.text('scoreSignal'), /WAIT.*expired/);
 });
 
-test('popup suppresses a stale contract quote independently of chain freshness', () => {
+test('popup does not block an entry because an optional quote is old', () => {
   const app = harness({ ...buy, candidate: { quoteUpdatedAt: 100000 }, entryTiming: { eligible: true, setup: { expiresAt: 120000 } } });
   app.advance(10001);
-  assert.match(app.text('scoreSignal'), /WAIT.*expired/);
+  assert.equal(app.text('scoreSignal'), 'BUY CALL');
+});
+
+test('option data health button reports fresh complete Greek data', () => {
+  const app = harness({ ...buy, optionDataHealth: {
+    healthy: true, loadedStrikes: 20, readableCalls: 20, readablePuts: 20,
+    fieldCoverage: { ltp: 40, oi: 40, oiChg: 40, volume: 40, iv: 40, delta: 40, theta: 40, gamma: 40, vega: 40 }
+  } });
+  app.click('checkDataHealth');
+  assert.match(app.text('dataHealthStatus'), /healthy and reading option data successfully/);
+  assert.match(app.text('dataHealthStatus'), /gamma and vega/);
+});
+
+test('option data health button reports missing fields', () => {
+  const app = harness({ ...buy, optionDataHealth: {
+    healthy: false, loadedStrikes: 20, readableCalls: 20, readablePuts: 20,
+    fieldCoverage: { ltp: 40, oi: 40, oiChg: 40, volume: 40, iv: 40, delta: 40, theta: 40, gamma: 0, vega: 0 }
+  } });
+  app.click('checkDataHealth');
+  assert.match(app.text('dataHealthStatus'), /missing GAMMA, VEGA/);
 });

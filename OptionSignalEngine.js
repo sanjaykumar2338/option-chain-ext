@@ -18,8 +18,8 @@
       this.oiHistoryByMarket = new Map();
       this.entrySetups = new Map();
       this.entryOptions = {
-        maxSpreadPct: 3, quoteMaxAgeMs: 10000, confirmationMs: 10000,
-        confirmationUpdates: 3, setupLifetimeMs: 90000, entryLifetimeMs: 15000,
+        confirmationMs: 10000, confirmationUpdates: 3,
+        setupLifetimeMs: 90000, entryLifetimeMs: 15000,
         rearmMs: 30000, triggerBufferPct: 0.01
       };
       for (const key of Object.keys(this.entryOptions)) {
@@ -68,12 +68,11 @@
       );
       const blockers = [...dataQuality.issues];
       if (signal.key !== "neutral" && !candidate) blockers.push(marketState.sessionOpen !== undefined
-        ? `Need a nearby liquid contract with fresh bid/ask quotes and spread ≤ ${this.entryOptions.maxSpreadPct}%`
+        ? "Need one of the first three ITM contracts with usable price, OI and volume"
         : "No liquid nearby contract with usable prices and Greeks");
       if (marketState.sessionOpen !== undefined) {
         entryTiming = this.assessPrecisionEntry(normalizedMarketState, normalizedHistory,
           biasSignal.key, candidate, entryTiming, blockers);
-        if (candidate) entryTiming.quoteExpiresAt = candidate.quoteUpdatedAt + this.entryOptions.quoteMaxAgeMs;
       }
       if (blockers.length) signal = { key: "neutral", label: "WAIT", detail: blockers[0], color: "#64748b" };
       else if (signal.key !== "neutral" && !entryTiming.eligible) {
@@ -1092,30 +1091,23 @@
 
     selectCandidate(state, side) {
       const step = this.estimateStrikeStep(state.strikes);
+      const allowedStrikes = new Set(this.getItmStrikes(state, side, 3));
       const candidates = [];
       for (const row of state.strikes) {
         const quote = row[side];
         if (!quote || !(quote.ltp > 0.05) || !(quote.oi > 0) || !(quote.volume > 0)
-          || Math.abs(row.strike - state.spotPrice) > step * 3) continue;
+          || !allowedStrikes.has(row.strike)) continue;
         if (Number.isFinite(quote.delta) && (Math.abs(quote.delta) < 0.15 || Math.abs(quote.delta) > 0.9 || Math.sign(quote.delta) !== (side === "call" ? 1 : -1))) continue;
         if (Number.isFinite(quote.iv) && (quote.iv <= 0 || quote.iv >= 300)) continue;
         if (Number.isFinite(quote.theta) && Math.abs(quote.theta) > quote.ltp * 5) continue;
         if ((Number.isFinite(quote.gamma) && quote.gamma < 0) || (Number.isFinite(quote.vega) && quote.vega < 0)) continue;
-        if ((Number.isFinite(quote.askQty) && quote.askQty <= 0) || (Number.isFinite(quote.bidQty) && quote.bidQty <= 0)) continue;
-        if ((Number.isFinite(quote.bidPrice) && quote.bidPrice <= 0)
-          || (Number.isFinite(quote.askPrice) && quote.askPrice <= 0)) continue;
         let spreadPct = NaN;
         if (Number.isFinite(quote.bidPrice) && Number.isFinite(quote.askPrice)) {
-          if (!(quote.bidPrice > 0) || quote.askPrice < quote.bidPrice) continue;
-          spreadPct = (quote.askPrice - quote.bidPrice) / ((quote.askPrice + quote.bidPrice) / 2) * 100;
-          if (spreadPct > 10) continue;
+          if (quote.bidPrice > 0 && quote.askPrice >= quote.bidPrice) {
+            spreadPct = (quote.askPrice - quote.bidPrice) / ((quote.askPrice + quote.bidPrice) / 2) * 100;
+          }
         }
         const warnings = ["delta", "iv", "theta", "gamma", "vega"].filter((key) => !Number.isFinite(quote[key])).map((key) => `${key} unavailable`);
-        if (state.sessionOpen !== undefined && (!Number.isFinite(spreadPct)
-          || spreadPct > this.entryOptions.maxSpreadPct
-          || !Number.isFinite(quote.quoteUpdatedAt)
-          || state.timestamp < quote.quoteUpdatedAt
-          || state.timestamp - quote.quoteUpdatedAt > this.entryOptions.quoteMaxAgeMs)) continue;
         if (!Number.isFinite(spreadPct)) warnings.push("Bid/ask spread unavailable");
         const thetaCostPct = Number.isFinite(quote.theta) ? Math.abs(quote.theta) / quote.ltp * 100 : NaN;
         const rank = Math.abs(row.strike - state.spotPrice) / step
@@ -1133,6 +1125,17 @@
       const active = this.entrySetups.get(this.marketKey(state));
       const locked = active?.side === side && !active.terminal ? candidates.find(item => item.strike === active.strike) : null;
       return locked || candidates.sort((a, b) => a.rank - b.rank || b.volume - a.volume)[0] || null;
+    }
+
+    getItmStrikes(state, side, limit = 3) {
+      const strikes = [...new Set((state.strikes || []).map(row => row.strike))].filter(Number.isFinite);
+      if (side === "call") {
+        return strikes.filter(strike => strike < state.spotPrice).sort((a, b) => b - a).slice(0, limit);
+      }
+      if (side === "put") {
+        return strikes.filter(strike => strike > state.spotPrice).sort((a, b) => a - b).slice(0, limit);
+      }
+      return [];
     }
 
     estimateStrikeStep(strikes) {

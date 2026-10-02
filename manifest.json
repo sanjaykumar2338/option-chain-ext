@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Upstox Option Chain Signal Engine",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Scrapes Upstox Pro option-chain data and overlays a quantitative call/put signal.",
   "permissions": [
     "notifications",
@@ -37,7 +37,6 @@
       ],
       "js": [
         "OptionSignalEngine.js",
-        "depthScanner.js",
         "content.js"
       ],
       "run_at": "document_idle"
