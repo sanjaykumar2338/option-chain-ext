@@ -33,7 +33,23 @@
     currentSignal.textContent = snapshot.signalLabel || "--";
     currentSignal.className = `badge ${snapshot.signalKey || "neutral"}`;
     currentMeta.textContent = `${snapshot.stockName || "Option Chain"} · ${snapshot.expiry || "expiry unavailable"} · ${new Date(snapshot.updatedAt).toLocaleString("en-IN")}`;
+    const research = snapshot.research;
+    if (research) {
+      addCard(healthGrid, "Experimental bias (no alerts)", research.available ? `${research.bias} · ${research.score}` : "Collecting / unavailable");
+      addCard(healthGrid, "Recent buildup (experimental)", number(research.recentBuildUp?.score, 0));
+      addCard(healthGrid, "25-delta skew change score (experimental)", number(research.matchedSkew?.score, 0));
+    }
     addCard(healthGrid, "Score", String(snapshot.totalScore ?? "--"));
+    addCard(healthGrid, "Directional bias", snapshot.biasSignalLabel || "--");
+    addCard(healthGrid, "Entry timing", snapshot.entryTiming?.key || "--");
+    const setup = snapshot.entryTiming?.setup;
+    if (setup) {
+      addCard(healthGrid, "Spot trigger", number(setup.entryLevel ?? setup.triggerSpot));
+      addCard(healthGrid, "Spot invalidation", number(setup.invalidationSpot));
+      addCard(healthGrid, "Fresh price updates", String(setup.updates));
+      addCard(healthGrid, "Setup / entry expires", new Date(setup.expiresAt).toLocaleTimeString("en-IN"));
+    }
+    addCard(healthGrid, "Candidate spread", Number.isFinite(snapshot.candidate?.spreadPct) ? `${number(snapshot.candidate.spreadPct)}%` : "--");
     addCard(healthGrid, "Data quality", `${snapshot.dataQuality?.score ?? 0}/100`);
     addCard(healthGrid, "Loaded / valid rows", `${snapshot.dataQuality?.loadedRows ?? 0} / ${snapshot.dataQuality?.validRows ?? 0}`);
     addCard(healthGrid, "OI PCR", number(snapshot.metrics?.pcrOi));
@@ -41,13 +57,14 @@
     for (const [name, value] of Object.entries(snapshot.factors || {})) {
       addCard(factorGrid, name.replace(/([A-Z])/g, " $1"), `${value > 0 ? "+" : ""}${number(value, 0)}`, value > 0 ? "positive" : value < 0 ? "negative" : "");
     }
-    currentIssues.textContent = [...(snapshot.blockers || []), ...(snapshot.dataQuality?.warnings || [])].join(" · ") || "No current blockers.";
+    currentIssues.textContent = [research?.reason ? `Experimental: ${research.reason}` : "", snapshot.entryTiming?.eligible === false ? snapshot.entryTiming.detail : "", ...(snapshot.blockers || []), ...(snapshot.dataQuality?.warnings || [])].filter(Boolean).join(" · ") || "No current blockers.";
   }
 
   function outcomeCell(record, minutes) {
     const outcome = record.outcomes?.[String(minutes)];
     const td = document.createElement("td");
     td.textContent = outcome ? `${outcome.result}${Number.isFinite(outcome.spotMovePct) ? ` ${outcome.spotMovePct > 0 ? "+" : ""}${outcome.spotMovePct.toFixed(2)}%` : ""}` : "pending";
+    if (outcome?.comparisonReady) td.title = `Directional comparison only: existing ${outcome.baselineBiasResult}; experimental ${outcome.researchBiasResult}`;
     if (outcome?.result) td.className = `result-${outcome.result}`;
     return td;
   }
@@ -65,6 +82,7 @@
       const values = [
         new Date(record.time).toLocaleString("en-IN"), record.stockName || record.indexName || "--",
         record.signalLabel || "--", String(record.score ?? "--"),
+        record.research?.available ? `${record.research.bias} / ${record.research.score}` : "--",
         `${record.dataQuality?.loadedRows ?? 0}/${record.dataQuality?.validRows ?? 0}`,
         Number.isFinite(record.dataUpdatedAt) ? `${Math.max(0, Math.round((record.time - record.dataUpdatedAt) / 1000))}s` : "--"
       ];

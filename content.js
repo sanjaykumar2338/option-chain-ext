@@ -28,7 +28,28 @@
   const SIGNAL_TOAST_ID = "upstox-quant-signal-toast";
   const SIGNAL_NOTIFICATION_TYPE = "UPSTOX_OPTION_SIGNAL";
   const engine = new OptionSignalEngine();
+  const scannedDepth = new Map();
+  let depthScanStatus = 'Depth scan idle';
+  const depthScanner = new OptionDepthScanner({
+    document,
+    getContext: () => !stopped && hasValidExtensionContext() && isOptionChainPage() ? scrapeMarketState(false) : null,
+    onQuote: (target, quote) => {
+      scannedDepth.set(`${target.marketKey}|${target.strike}|${target.side}`, quote);
+      scheduleFallbackDomCycle();
+    },
+    onStatus: (message, running) => {
+      depthScanStatus = message;
+      const overlay = document.getElementById(OVERLAY_ID);
+      const button = overlay?.querySelector('[data-role="scan-depth"]');
+      if (button) button.innerText = running ? 'Stop depth scan' : 'Scan bid/ask';
+      const status = overlay?.querySelector('[data-role="depth-status"]');
+      if (status) status.innerText = message;
+    },
+    setTimer: (callback, delay) => window.setTimeout(callback, delay),
+    clearTimer: timer => window.clearTimeout(timer)
+  });
   let marketHistory = [];
+  let lastDebugReading = null;
   let lastSignalKey = null;
   let lastNotification = {
     signalKey: null,
@@ -61,6 +82,7 @@
   function stopInvalidatedContext() {
     if (stopped) return;
     stopped = true;
+    depthScanner.stop();
     window.clearTimeout(fallbackTimer);
     window.clearTimeout(signalToastTimer);
     window.clearInterval(heartbeatTimer);
@@ -193,6 +215,12 @@
       if (Number.isFinite(fallback[key]) && !Number.isFinite(merged[key])) merged[key] = fallback[key];
       if (key === "instrumentKey" && !merged[key]) merged[key] = fallback[key];
     });
+    // Never attach a network timestamp to a DOM or mixed-source bid/ask pair.
+    if (Number.isFinite(primary?.bidPrice) || Number.isFinite(primary?.askPrice)) {
+      merged.quoteUpdatedAt = primary.quoteUpdatedAt;
+      if (!Number.isFinite(primary.bidPrice) || !Number.isFinite(primary.askPrice)) merged.quoteUpdatedAt = NaN;
+      merged.mixedQuote = !Number.isFinite(primary.bidPrice) || !Number.isFinite(primary.askPrice);
+    }
     return merged;
   }
 
@@ -580,6 +608,9 @@
       return canonicalUnderlyingKey(row.underlyingKey) === canonicalUnderlyingKey(fallbackState.underlyingKey);
     }));
     if (!allStrikes.length) return null;
+    for (const row of allStrikes) for (const side of ["call", "put"]) {
+      if (Number.isFinite(row[side]?.bidPrice) && Number.isFinite(row[side]?.askPrice)) row[side].quoteUpdatedAt = timestamp;
+    }
     const payloadSpot = allStrikes.find((row) => Number.isFinite(row.spotPrice) && row.spotPrice > 0)?.spotPrice;
     const payload = detail?.payload;
     // Metadata is only accepted at response scope after every parsed row matches.
@@ -611,6 +642,39 @@
     const cutoff = marketState.timestamp - MARKET_HISTORY_WINDOW_MS;
     marketHistory = marketHistory.filter((state) => state.timestamp >= cutoff && engine.marketKey(state) === engine.marketKey(marketState));
     if (!marketHistory.length || marketState.timestamp - marketHistory.at(-1).timestamp >= 5000) marketHistory.push(marketState);
+  }
+
+  function logOptionChainReading() {
+    if (!isOptionChainPage()) return;
+    const capturedAt = Date.now();
+    const domOnly = scrapeMarketState(false);
+    const rawPageRows = ['left', 'right'].flatMap(side =>
+      Array.from(document.querySelectorAll(`tr[data-id^="${side}TableOCRow"]`)).map(row => ({
+        side: side === 'left' ? 'call' : 'put',
+        strike: getStrikeFromRow(row, side),
+        headers: Array.from(row.closest?.('table')?.querySelectorAll('thead th') || [])
+          .map(header => String(header.innerText ?? header.textContent ?? '').trim()),
+        cells: getCellTexts(row)
+      })));
+    const snapshot = {
+      capturedAt: new Date(capturedAt).toISOString(),
+      note: 'Missing/non-finite numeric values are null. DOM OI labelled in lakhs is converted to units. Raw cells are captured now; lastProcessed is the most recent analysis and may be older. Only loaded/captured rows are included.',
+      depthScanStatus,
+      depthScanDetails: {
+        running: depthScanner.running,
+        current: depthScanner.index || 0,
+        total: depthScanner.queue?.length || 0,
+        captured: depthScanner.captured || 0,
+        skipped: depthScanner.skipped || 0,
+        skippedContracts: depthScanner.skipReasons || []
+      },
+      rawPageRows,
+      domOnly,
+      mergedReadingNow: scrapeMarketState(),
+      lastProcessed: lastDebugReading?.input?.marketKey === domOnly.marketKey ? lastDebugReading : null
+    };
+    // A JSON string freezes the reading; DevTools cannot display later mutated values.
+    console.log('[Upstox data snapshot — copy the JSON below]\n' + JSON.stringify(snapshot, null, 2));
   }
 
   function createOverlay() {
@@ -652,10 +716,19 @@
       '<div data-role="signal" style="font-weight:900;font-size:15px;overflow-wrap:anywhere;"></div>',
       '<div data-role="meta" style="opacity:0.92;font-weight:700;overflow-wrap:anywhere;"></div>',
       '<div data-role="forecast" style="opacity:0.95;font-weight:800;overflow-wrap:anywhere;"></div>',
-      '<div data-role="detail" style="opacity:0.78;overflow-wrap:anywhere;"></div>'
+      '<div data-role="detail" style="opacity:0.78;overflow-wrap:anywhere;"></div>',
+      '<div data-role="depth-status" style="font-size:11px;font-weight:700;"></div>',
+      '<button type="button" data-role="scan-depth" style="pointer-events:auto;align-self:flex-start;padding:5px 9px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;color:#111827;font-weight:700;cursor:pointer;">Scan bid/ask</button>',
+      '<button type="button" data-role="log-data" style="pointer-events:auto;align-self:flex-start;margin-top:6px;padding:5px 9px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;color:#111827;font-weight:700;cursor:pointer;">Log data to console</button>'
     ].join("");
 
     document.documentElement.appendChild(overlay);
+    overlay.querySelector('[data-role="log-data"]').addEventListener('click', logOptionChainReading);
+    overlay.querySelector('[data-role="scan-depth"]').addEventListener('click', () => {
+      if (depthScanner.running) depthScanner.stop();
+      else depthScanner.start();
+    });
+    overlay.querySelector('[data-role="depth-status"]').innerText = depthScanStatus;
     restoreOverlayPosition(overlay);
     enableOverlayDrag(overlay);
     return overlay;
@@ -868,14 +941,24 @@
     }, SIGNAL_TOAST_MS);
   }
 
-  function playSignalAudioCue(signalKey) {
+  async function playSignalAudioCue(signalKey) {
     const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
     if (!AudioContextCtor) return;
+    // Chrome blocks Web Audio before the document has received a user gesture.
+    // Skip the optional cue instead of creating a suspended context/error entry.
+    if (globalThis.navigator?.userActivation
+      && globalThis.navigator.userActivation.hasBeenActive !== true) return;
 
+    let audioContext;
     try {
-      const audioContext = new AudioContextCtor();
+      audioContext = new AudioContextCtor();
+      if (audioContext.state === "suspended") await audioContext.resume();
+      if (audioContext.state !== "running") {
+        await audioContext.close().catch(() => {});
+        return;
+      }
       const frequencies = signalKey === "call" ? [660, 880] : [440, 330];
-      const startedAt = audioContext.currentTime;
+      const startedAt = audioContext.currentTime + 0.02;
 
       frequencies.forEach((frequency, index) => {
         const oscillator = audioContext.createOscillator();
@@ -897,8 +980,9 @@
       window.setTimeout(() => {
         audioContext.close().catch(() => {});
       }, 500);
-    } catch (error) {
-      console.warn("[Upstox Quant Signal] Audio cue failed", error);
+    } catch (_error) {
+      // Audio is non-essential; signal display, storage and notifications continue.
+      if (audioContext?.close) await audioContext.close().catch(() => {});
     }
   }
 
@@ -918,6 +1002,11 @@
         signalLabel: result.signal.label,
         signalDetail: result.signal.detail,
         signalKey: result.signal.key,
+        biasSignalKey: result.biasSignal?.key,
+        biasSignalLabel: result.biasSignal?.label,
+        entryTiming: result.entryTiming,
+        entryPolicy: result.entryPolicy,
+        research: result.research,
         totalScore: result.totalScore,
         strength: result.strength,
         forecastLabel: result.forecast.label,
@@ -1056,7 +1145,17 @@
           const optionPnl = Number.isFinite(record.entryOptionPrice) && Number.isFinite(exitOptionPrice)
             ? exitOptionPrice - record.entryOptionPrice
             : NaN;
+          const classifyBias = key => {
+            if (!['call', 'put'].includes(key)) return key === 'neutral' ? 'observed' : null;
+            const move = spotMove * (key === 'call' ? 1 : -1);
+            return move > threshold ? 'hit' : move < -threshold ? 'miss' : 'flat';
+          };
+          const comparisonReady = record.research?.available && result.dataQuality.ready
+            && state.timestamp - record.time - horizonMs <= 15000;
           outcomes[minutes] = {
+            comparisonReady: Boolean(comparisonReady),
+            baselineBiasResult: comparisonReady ? classifyBias(record.research.baselineBias) : null,
+            researchBiasResult: comparisonReady ? classifyBias(record.research.bias) : null,
             time: state.timestamp,
             spotPrice: state.spotPrice,
             spotMove,
@@ -1089,6 +1188,11 @@
           source: state.source,
           signalKey: result.signal.key,
           signalLabel: result.signal.label,
+          biasSignalKey: result.biasSignal?.key,
+          biasSignalLabel: result.biasSignal?.label,
+          entryTiming: result.entryTiming,
+          entryPolicy: result.entryPolicy,
+          research: result.research,
           signalDetail: result.signal.detail,
           score: result.totalScore,
           strength: result.strength,
@@ -1153,6 +1257,14 @@
     });
   }
 
+  const HISTORY_REPEAT_WINDOW_MS = 2 * 60 * 1000;
+  const pendingHistoryWrites = new Set();
+
+  function historySignalKey(record) {
+    return JSON.stringify([record.marketKey || record.stockName || record.indexName || '',
+      record.expiry || '', record.signalKey, record.candidate?.strike ?? null]);
+  }
+
   function recordSignalHistory(result) {
     if (!hasValidExtensionContext()) {
       stopInvalidatedContext();
@@ -1190,21 +1302,41 @@
       reasons: result.reasons
     };
 
+    const historyKey = historySignalKey(record);
+    if (pendingHistoryWrites.has(historyKey)) return;
+    pendingHistoryWrites.add(historyKey);
     try { storage.get({ [SIGNAL_HISTORY_STORAGE_KEY]: [] }, (data) => {
-      if (!hasValidExtensionContext()) return;
+      if (!hasValidExtensionContext() || chrome.runtime.lastError) {
+        pendingHistoryWrites.delete(historyKey);
+        return;
+      }
       const records = Array.isArray(data[SIGNAL_HISTORY_STORAGE_KEY])
         ? data[SIGNAL_HISTORY_STORAGE_KEY]
         : [];
-      if (records.some((existing) => existing.id === record.id)) return;
+      const duplicate = records.some(existing => existing.id === record.id
+        || (historySignalKey(existing) === historyKey
+          && Number.isFinite(existing.signalTime)
+          && record.signalTime >= existing.signalTime
+          && record.signalTime - existing.signalTime < HISTORY_REPEAT_WINDOW_MS));
+      if (duplicate) {
+        pendingHistoryWrites.delete(historyKey);
+        return;
+      }
       try {
         storage.set({
           [SIGNAL_HISTORY_STORAGE_KEY]: records.concat(record).slice(-SIGNAL_HISTORY_MAX_RECORDS)
+        }, () => {
+          // Consume write errors and allow a later signal to retry.
+          void chrome.runtime.lastError;
+          pendingHistoryWrites.delete(historyKey);
         });
       } catch (error) {
+        pendingHistoryWrites.delete(historyKey);
         if (isContextInvalidationError(error)) stopInvalidatedContext();
         else throw error;
       }
     }); } catch (error) {
+      pendingHistoryWrites.delete(historyKey);
       if (isContextInvalidationError(error)) stopInvalidatedContext();
       else throw error;
     }
@@ -1319,7 +1451,7 @@
     if (signalChanged) {
       recordSignalBacktest(result);
       recordSignalHistory(result);
-      playSignalAudioCue(result.signal.key);
+      void playSignalAudioCue(result.signal.key);
     }
 
     lastNotification = {
@@ -1367,13 +1499,21 @@
     const now = Date.now();
     const key = engine.marketKey(state);
     const rows = new Map(state.strikes.map((row) => [row.strike, row]));
+    for (const [strike, row] of rows) for (const side of ["call", "put"]) {
+      const quote = row[side];
+      const previous = freshness?.key === key ? freshness.rows.get(strike)?.[side] : null;
+      if (!quote || quote.mixedQuote || Number.isFinite(quote.quoteUpdatedAt)
+        || !Number.isFinite(quote.bidPrice) || !Number.isFinite(quote.askPrice)) continue;
+      const quoteChanged = !previous || quote.bidPrice !== previous.bidPrice || quote.askPrice !== previous.askPrice;
+      quote.quoteUpdatedAt = quoteChanged ? now : previous.quoteUpdatedAt;
+    }
     let changed = false;
     if (freshness?.key === key) {
       changed = Number.isFinite(state.spotPrice) && Number.isFinite(freshness.spot) && state.spotPrice !== freshness.spot;
       for (const [strike, row] of rows) {
         const previous = freshness.rows.get(strike);
         if (!previous) continue;
-        for (const side of ["call", "put"]) for (const field of ["ltp", "oi", "volume"]) {
+        for (const side of ["call", "put"]) for (const field of ["ltp", "oi", "volume", "bidPrice", "askPrice"]) {
           if (Number.isFinite(row[side]?.[field]) && Number.isFinite(previous[side]?.[field]) && row[side][field] !== previous[side][field]) changed = true;
         }
       }
@@ -1397,7 +1537,15 @@
         return;
       }
       if (!isOptionChainPage()) return;
+      for (const [key, quote] of scannedDepth) {
+        if (Date.now() - quote.quoteUpdatedAt > 10000 || !key.startsWith(`${marketState.marketKey}|`)) scannedDepth.delete(key);
+      }
+      for (const row of marketState.strikes) for (const side of ['call', 'put']) {
+        const quote = scannedDepth.get(`${marketState.marketKey}|${row.strike}|${side}`);
+        if (quote && !(row[side]?.bidPrice > 0 && row[side]?.askPrice > 0)) row[side] = { ...row[side], ...quote };
+      }
       stampDataStatus(marketState);
+      lastDebugReading = { input: marketState, analysis: null };
       if (!marketState.strikes.length) {
         updateOverlayError("Option-chain rows not ready", marketState.stockName);
         return;
@@ -1409,6 +1557,9 @@
 
       const history = getHistoryForMarket(marketState);
       const result = engine.analyze(marketState, history);
+      lastDebugReading.analysis = { signal: result.signal, biasSignal: result.biasSignal,
+        totalScore: result.totalScore, factors: result.factors, dataQuality: result.dataQuality,
+        blockers: result.blockers, candidate: result.candidate, entryTiming: result.entryTiming };
       rememberMarketState(result.marketState);
       updateEvaluationLog(result);
       evaluatePendingSignals(result.marketState);
@@ -1501,6 +1652,7 @@
   }
 
   function handleVisibilityChange() {
+    if (document.hidden && depthScanner.running) depthScanner.stop("Depth scan paused: tab hidden");
     if (!document.hidden) scheduleFallbackDomCycle();
   }
 

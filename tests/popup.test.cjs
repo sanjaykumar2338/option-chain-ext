@@ -60,3 +60,16 @@ test('old warming snapshots are recognized; a ready zero forecast remains zero',
   assert.equal(app.text('forecastConfidence'), '0/100');
   assert.match(app.text('scoreDetail'), /Sideways/);
 });
+
+test('popup suppresses an expired entry even with fresh chain data', () => {
+  const app = harness({ ...buy, candidate: { quoteUpdatedAt: 100000 }, entryTiming: { eligible: true, setup: { expiresAt: 105000 } } });
+  assert.equal(app.text('scoreSignal'), 'BUY CALL');
+  app.advance(5000);
+  assert.match(app.text('scoreSignal'), /WAIT.*expired/);
+});
+
+test('popup suppresses a stale contract quote independently of chain freshness', () => {
+  const app = harness({ ...buy, candidate: { quoteUpdatedAt: 100000 }, entryTiming: { eligible: true, setup: { expiresAt: 120000 } } });
+  app.advance(10001);
+  assert.match(app.text('scoreSignal'), /WAIT.*expired/);
+});

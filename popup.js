@@ -103,13 +103,18 @@
     scoreStock.innerText = `${snapshot.stockName || "Option Chain"} | ${snapshot.indexName || "--"}`;
     const stale = !Number.isFinite(snapshot.updatedAt) || Date.now() - snapshot.updatedAt > 30000
       || (Number.isFinite(snapshot.dataUpdatedAt) && Date.now() - snapshot.dataUpdatedAt > 30000);
-    scoreSignal.innerText = stale ? "WAIT — stale data" : snapshot.signalLabel || "--";
-    scoreSignal.dataset.signal = stale ? "neutral" : snapshot.signalKey || "neutral";
-    if (stale) {
+    const entryExpired = snapshot.entryTiming?.eligible === true && Number.isFinite(snapshot.entryTiming?.setup?.expiresAt)
+      && Date.now() >= snapshot.entryTiming.setup.expiresAt;
+    const quoteExpired = snapshot.entryTiming?.setup && (!Number.isFinite(snapshot.candidate?.quoteUpdatedAt)
+      || Date.now() > (snapshot.entryTiming.quoteExpiresAt ?? snapshot.candidate.quoteUpdatedAt + 10000));
+    const entryUnavailable = entryExpired || quoteExpired;
+    scoreSignal.innerText = entryUnavailable ? "WAIT — entry expired" : stale ? "WAIT — stale data" : snapshot.signalLabel || "--";
+    scoreSignal.dataset.signal = stale || entryUnavailable ? "neutral" : snapshot.signalKey || "neutral";
+    if (stale || entryUnavailable) {
       currentStrength.innerText = "--";
       currentScore.innerText = "--";
       forecastConfidence.innerText = "--";
-      scoreDetail.innerText = `No recent data. Open or refresh the option-chain page. Last checked ${formatTime(snapshot.updatedAt)}.`;
+      scoreDetail.innerText = entryUnavailable ? "Entry window or candidate quote expired. Wait for a fresh confirmed setup." : `No recent data. Open or refresh the option-chain page. Last checked ${formatTime(snapshot.updatedAt)}.`;
       return;
     }
     currentStrength.innerText = Number.isFinite(snapshot.strength)

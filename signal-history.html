@@ -28,15 +28,24 @@
             <option value="put">BUY PUT</option>
           </select>
         </label>
+        <label>Dates per page
+          <select id="pageSize"><option value="10" selected>10</option><option value="25">25</option><option value="50">50</option><option value="100">100</option></select>
+        </label>
       </div>
 
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Time</th><th>Instrument</th><th>Expiry</th><th>Signal</th><th>Score</th><th>Spot</th><th>Contract</th><th>Price</th></tr></thead>
-          <tbody id="historyRows"></tbody>
-        </table>
-        <p id="emptyState" class="empty" hidden>No stored signals match these filters.</p>
+      <div class="history-card">
+        <div class="table-wrap">
+          <table aria-label="Signal history by date">
+            <thead><tr><th scope="col">Date ↓ (IST)</th><th scope="col">Signals</th><th scope="col">Buy call</th><th scope="col">Buy put</th><th scope="col">Instruments</th><th scope="col">Last signal (IST)</th><th scope="col">Action</th></tr></thead>
+            <tbody id="dateRows"></tbody>
+          </table>
+        </div>
+        <nav class="pagination" aria-label="History date pages">
+          <span id="pageInfo" role="status" aria-live="polite"></span>
+          <div class="page-buttons"><button id="previousPage" type="button">Previous</button><button id="nextPage" type="button">Next</button></div>
+        </nav>
       </div>
+      <p id="emptyState" class="empty" hidden>No stored signals match these filters.</p>
     </main>
     <script src="signal-history.js"></script>
   </body>

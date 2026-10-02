@@ -14,8 +14,17 @@
   const OI_VELOCITY_LOOKBACKS_MS = [60 * 1000, 3 * 60 * 1000];
 
   class OptionSignalEngine {
-    constructor() {
+    constructor(entryOptions = {}) {
       this.oiHistoryByMarket = new Map();
+      this.entrySetups = new Map();
+      this.entryOptions = {
+        maxSpreadPct: 3, quoteMaxAgeMs: 10000, confirmationMs: 10000,
+        confirmationUpdates: 3, setupLifetimeMs: 90000, entryLifetimeMs: 15000,
+        rearmMs: 30000, triggerBufferPct: 0.01
+      };
+      for (const key of Object.keys(this.entryOptions)) {
+        if (Number.isFinite(entryOptions[key]) && entryOptions[key] > 0) this.entryOptions[key] = entryOptions[key];
+      }
     }
 
     /**
@@ -46,13 +55,36 @@
 
       const rawScore = Object.values(factors).reduce((sum, value) => sum + value, 0);
       const totalScore = this.clamp(Math.round(rawScore), -100, 100);
-      let signal = this.getSignal(totalScore, trend);
+      const biasSignal = this.getSignal(totalScore, trend);
+      let signal = biasSignal;
       const dataQuality = this.assessData(marketState);
       const metrics = this.calculateMarketMetrics(normalizedMarketState);
       const candidate = signal.key === "neutral" ? null : this.selectCandidate(marketState, signal.key);
+      let entryTiming = this.assessEntryTiming(
+        normalizedMarketState,
+        normalizedHistory,
+        signal.key,
+        candidate
+      );
       const blockers = [...dataQuality.issues];
-      if (signal.key !== "neutral" && !candidate) blockers.push("No liquid nearby contract with usable prices and Greeks");
+      if (signal.key !== "neutral" && !candidate) blockers.push(marketState.sessionOpen !== undefined
+        ? `Need a nearby liquid contract with fresh bid/ask quotes and spread ≤ ${this.entryOptions.maxSpreadPct}%`
+        : "No liquid nearby contract with usable prices and Greeks");
+      if (marketState.sessionOpen !== undefined) {
+        entryTiming = this.assessPrecisionEntry(normalizedMarketState, normalizedHistory,
+          biasSignal.key, candidate, entryTiming, blockers);
+        if (candidate) entryTiming.quoteExpiresAt = candidate.quoteUpdatedAt + this.entryOptions.quoteMaxAgeMs;
+      }
       if (blockers.length) signal = { key: "neutral", label: "WAIT", detail: blockers[0], color: "#64748b" };
+      else if (signal.key !== "neutral" && !entryTiming.eligible) {
+        signal = {
+          key: "neutral",
+          label: `${biasSignal.key === "call" ? "BULLISH" : "BEARISH"} — WAIT FOR ENTRY`,
+          detail: entryTiming.detail,
+          color: "#d97706"
+        };
+      }
+      if (signal.key !== "neutral" && marketState.sessionOpen !== undefined) signal = { ...signal, detail: entryTiming.detail };
       const reasons = Object.entries(factors).filter(([, value]) => Math.abs(value) >= 3)
         .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1])).slice(0, 3)
         .map(([name, value]) => `${name.replace(/([A-Z])/g, " $1")}: ${value > 0 ? "+" : ""}${Math.round(value)}`);
@@ -65,9 +97,11 @@
       );
 
       const result = {
+        research: this.compareResearchFactors(normalizedMarketState, normalizedHistory, factors, trend, dataQuality.ready),
+        entryPolicy: "precision-v1",
         totalScore,
         strength: Math.abs(totalScore),
-        signal,
+        signal, biasSignal, entryTiming,
         forecast,
         factors,
         dataQuality, metrics, candidate: blockers.length ? null : candidate, blockers, reasons,
@@ -393,6 +427,105 @@
       return totalWeight ? Math.round(this.clamp(pressure / totalWeight, -1, 1) * 24) : 0;
     }
 
+    researchLookback(state, history) {
+      const day = timestamp => new Date(timestamp + 19800000).toISOString().slice(0, 10);
+      return history.filter(item => this.marketKey(item) === this.marketKey(state)
+        && day(item.timestamp) === day(state.timestamp)
+        && state.timestamp - item.timestamp >= 45000 && state.timestamp - item.timestamp <= 75000)
+        .sort((a, b) => Math.abs(state.timestamp - a.timestamp - 60000)
+          - Math.abs(state.timestamp - b.timestamp - 60000))[0];
+    }
+
+    recentBuildUp(state, prior) {
+      const unavailable = reason => ({ available: false, score: null, reason });
+      if (!prior) return unavailable('Need a matching snapshot 45–75 seconds ago');
+      const oldRows = new Map(prior.strikes.map(row => [row.strike, row]));
+      const step = this.estimateStrikeStep(state.strikes);
+      let weighted = 0, total = 0, comparableRows = 0, activeSides = 0;
+      for (const row of state.strikes) {
+        if (Math.abs(row.strike - state.spotPrice) > step * 3) continue;
+        const old = oldRows.get(row.strike);
+        if (!old) continue;
+        const valid = ['call', 'put'].every(side => [row[side], old[side]].every(quote =>
+          quote && quote._hasCoreData !== false && quote.ltp > 0
+          && Number.isFinite(quote.oi) && quote.oi >= 0 && Number.isFinite(quote.volume) && quote.volume >= 0)
+          && row[side].volume >= old[side].volume);
+        if (!valid) continue;
+        comparableRows++;
+        const atm = this.calculateGaussianAtmWeight(row.strike, state.spotPrice, step * 3);
+        for (const side of ['call', 'put']) {
+          const current = row[side], previous = old[side];
+          const volume = current.volume - previous.volume;
+          if (!volume) continue;
+          activeSides++;
+          const weight = atm * Math.log1p(volume);
+          // Use matched LTP observations, never mix an old LTP with a new midpoint.
+          const score = this.scoreSideBuildUp(side, {
+            ltpChangePct: (current.ltp / previous.ltp - 1) * 100,
+            oiChg: current.oi - previous.oi
+          });
+          weighted += weight * score;
+          total += weight;
+        }
+      }
+      if (comparableRows < 3) return unavailable('Need three comparable nearby strike pairs without volume resets');
+      return { available: true, score: total ? Math.round(this.clamp(weighted / total * 36, -36, 36)) : 0,
+        comparableRows, activeSides, lookbackMs: state.timestamp - prior.timestamp };
+    }
+
+    matchedDeltaRiskReversal(state) {
+      const interpolate = side => {
+        const direction = side === 'call' ? 1 : -1;
+        const groups = new Map();
+        for (const row of state.strikes) {
+          const quote = row[side];
+          if (!quote || (row.strike - state.spotPrice) * direction < 0
+            || !Number.isFinite(quote.delta) || Math.sign(quote.delta) !== direction
+            || !Number.isFinite(quote.iv) || quote.iv <= 0 || quote.iv >= 300) continue;
+          const delta = Math.abs(quote.delta);
+          if (delta < 0.15 || delta > 0.35) continue;
+          const values = groups.get(delta) || [];
+          values.push(quote.iv);
+          groups.set(delta, values);
+        }
+        const points = [...groups].map(([delta, values]) => ({ delta, iv: this.median(values) })).sort((a, b) => a.delta - b.delta);
+        const exact = points.find(point => Math.abs(point.delta - 0.25) < 1e-8);
+        if (exact) return exact.iv;
+        const lower = points.filter(point => point.delta < 0.25).at(-1);
+        const upper = points.find(point => point.delta > 0.25);
+        if (!lower || !upper) return NaN; // Never extrapolate from one wing.
+        return lower.iv + (upper.iv - lower.iv) * (0.25 - lower.delta) / (upper.delta - lower.delta);
+      };
+      const callIv = interpolate('call'), putIv = interpolate('put');
+      if (!Number.isFinite(callIv) || !Number.isFinite(putIv)) {
+        return { available: false, reason: 'Need valid 25-delta IV or bracketing deltas on both wings' };
+      }
+      return { available: true, callIv, putIv, rr25: callIv - putIv,
+        // Relative skew makes the score invariant to decimal vs percent IV units.
+        relativeSkew: (callIv - putIv) / ((callIv + putIv) / 2) };
+    }
+
+    compareResearchFactors(state, history, factors, trend, dataReady) {
+      const prior = this.researchLookback(state, history);
+      const recent = this.recentBuildUp(state, prior);
+      const current = this.matchedDeltaRiskReversal(state);
+      const previous = prior ? this.matchedDeltaRiskReversal(prior) : null;
+      const skewReady = current.available && previous?.available;
+      const skew = { available: Boolean(skewReady), current,
+        score: skewReady ? Math.round(this.clamp((current.relativeSkew - previous.relativeSkew) / 0.10, -1, 1) * 10) : null,
+        change: skewReady ? current.relativeSkew - previous.relativeSkew : null,
+        reason: skewReady ? null : 'Need comparable matched-delta IV at both timestamps' };
+      const baselineScore = this.clamp(Math.round(Object.values(factors).reduce((sum, value) => sum + value, 0)), -100, 100);
+      const available = dataReady && recent.available && skew.available;
+      const proposed = { ...factors, directionalBuildUp: recent.score, ivSkewChange: skew.score,
+        spotConfirmation: recent.available ? this.scoreSpotConfirmation(recent.score, trend) : 0 };
+      const score = available ? this.clamp(Math.round(Object.values(proposed).reduce((sum, value) => sum + value, 0)), -100, 100) : null;
+      return { version: 'recent-rr25-v1', mode: 'shadow', available, recentBuildUp: recent, matchedSkew: skew,
+        baselineScore, baselineBias: this.getSignal(baselineScore, trend).key,
+        score, bias: available ? this.getSignal(score, trend).key : null,
+        reason: available ? null : !dataReady ? 'Market data is not ready' : !recent.available ? recent.reason : skew.reason };
+    }
+
     calculateComparableIvSkew(state) {
       const calls = [];
       const puts = [];
@@ -415,6 +548,161 @@
       if (!Number.isFinite(currentSkew) || !Number.isFinite(previousSkew)) return 0;
       // Rapidly increasing OTM put IV relative to call IV confirms downside risk.
       return Math.round(this.clamp(-(currentSkew - previousSkew) / 1.5, -1, 1) * 10);
+    }
+
+    assessEntryTiming(state, history, side, candidate) {
+      if (!['call', 'put'].includes(side)) {
+        return { eligible: false, key: "no-bias", detail: "No directional setup", metrics: {} };
+      }
+      const direction = side === "call" ? 1 : -1;
+      const shortPrior = this.getShortLookbackState(state, history);
+      // Unit/offline callers without a live-session marker retain the legacy behavior.
+      if (!shortPrior) {
+        return state.sessionOpen === undefined
+          ? { eligible: true, key: "unverified", detail: "Entry timing history unavailable", metrics: {} }
+          : { eligible: false, key: "warming", detail: "Collecting 30–60 seconds of entry-timing history", metrics: {} };
+      }
+
+      const shortMovePct = shortPrior.spotPrice > 0
+        ? (state.spotPrice / shortPrior.spotPrice - 1) * 100
+        : 0;
+      const fiveMinutePrior = this.getLookbackState(state, history, TREND_LOOKBACK_MS);
+      const fiveMinuteMovePct = fiveMinutePrior?.spotPrice > 0
+        ? (state.spotPrice / fiveMinutePrior.spotPrice - 1) * 100
+        : 0;
+      const vix = state.indiaVix > 0 ? state.indiaVix : 15;
+      const shortChaseLimit = Math.max(0.10, vix / 150);
+      const fiveMinuteChaseLimit = Math.max(0.25, vix / 60);
+      const directionalShortMove = shortMovePct * direction;
+      const directionalFiveMinuteMove = fiveMinuteMovePct * direction;
+
+      let premiumMovePct = NaN;
+      if (candidate) {
+        const oldRow = shortPrior.strikes.find((row) => row.strike === candidate.strike);
+        const previousPrice = this.optionMidPrice(oldRow?.[side] || {});
+        const currentPrice = this.optionMidPrice(candidate);
+        if (previousPrice > 0 && currentPrice > 0) premiumMovePct = (currentPrice / previousPrice - 1) * 100;
+      }
+      const metrics = {
+        shortMovePct,
+        fiveMinuteMovePct,
+        premiumMovePct,
+        shortChaseLimit,
+        fiveMinuteChaseLimit
+      };
+
+      if (directionalShortMove > shortChaseLimit) {
+        return { eligible: false, key: "spot-extended", detail: `Avoid chasing: spot already moved ${Math.abs(shortMovePct).toFixed(2)}% in about one minute`, metrics };
+      }
+      if (directionalFiveMinuteMove > fiveMinuteChaseLimit) {
+        return { eligible: false, key: "trend-extended", detail: `Avoid chasing: spot already moved ${Math.abs(fiveMinuteMovePct).toFixed(2)}% over five minutes`, metrics };
+      }
+      if (Number.isFinite(premiumMovePct) && premiumMovePct > 18) {
+        return { eligible: false, key: "premium-extended", detail: `Avoid chasing: selected option premium already rose ${premiumMovePct.toFixed(1)}%`, metrics };
+      }
+      if (directionalShortMove < -0.04) {
+        return { eligible: false, key: "pullback-active", detail: "Directional pullback is still active; waiting for stabilization", metrics };
+      }
+      return { eligible: true, key: "ready", detail: "Directional bias confirmed without an extended entry", metrics };
+    }
+
+    assessPrecisionEntry(state, history, side, candidate, timing, blockers) {
+      const key = this.marketKey(state);
+      const now = state.timestamp;
+      const options = this.entryOptions;
+      // A context switch cannot resume an old setup without observing confirmation again.
+      for (const otherKey of this.entrySetups.keys()) if (otherKey !== key) this.entrySetups.delete(otherKey);
+      const wait = (reason, detail, setup) => ({
+        eligible: false, key: reason,
+        detail: setup ? `${detail}; spot trigger ${(setup.entryLevel ?? setup.triggerSpot).toFixed(2)}, invalidation ${setup.invalidationSpot.toFixed(2)}` : detail,
+        metrics: timing.metrics,
+        ...(setup ? { setup: { ...setup } } : {})
+      });
+      if (blockers.length || !['call', 'put'].includes(side)) {
+        this.entrySetups.delete(key);
+        return wait('blocked', blockers[0] || 'Waiting for a directional setup');
+      }
+      let setup = this.entrySetups.get(key);
+      if (setup && (setup.side !== side || setup.strike !== candidate.strike || now < setup.lastAt)) {
+        this.entrySetups.delete(key);
+        setup = null;
+      }
+      const direction = side === 'call' ? 1 : -1;
+      const spot = state.spotPrice * direction;
+      const premium = this.optionMidPrice(candidate);
+      const finish = (reason, detail) => {
+        setup.terminal = reason;
+        setup.rearmAt = now + options.rearmMs;
+        setup.detail = detail;
+        return wait(reason, detail, setup);
+      };
+      if (setup?.terminal) {
+        if (now < setup.rearmAt) return wait(setup.terminal, setup.detail, setup);
+        this.entrySetups.delete(key);
+        setup = null;
+      }
+      if (setup) {
+        if (spot <= setup.invalidationSpot * direction) return finish('invalidated', 'Setup cancelled: spot crossed its invalidation level');
+        if (now >= setup.expiresAt) return finish('expired', 'Entry opportunity expired; waiting for a new setup');
+      }
+      if (!timing.eligible) {
+        // A pending pullback may recover; an active entry is cancelled on loss of timing.
+        if (setup?.triggeredAt) return finish('invalidated', timing.detail);
+        if (timing.key !== 'pullback-active') this.entrySetups.delete(key);
+        return wait(timing.key, timing.detail, setup);
+      }
+      if (!setup) {
+        const recent = history.filter(item => this.marketKey(item) === key
+          && item.timestamp < now && now - item.timestamp <= 60000 && item.spotPrice > 0);
+        if (!recent.length) return wait('warming', 'Collecting recent price levels');
+        const spots = recent.map(item => item.spotPrice * direction);
+        const buffer = state.spotPrice * options.triggerBufferPct / 100;
+        setup = {
+          side, strike: candidate.strike, startedAt: now, lastAt: now,
+          expiresAt: now + options.setupLifetimeMs, updates: 1,
+          triggerSpot: (Math.max(...spots, spot) + buffer) * direction,
+          invalidationSpot: (Math.min(...spots, spot) - buffer) * direction,
+          initialPremium: premium, lastPremium: premium, lastSpot: spot,
+          peak: spot, buffer, pullback: false
+        };
+        this.entrySetups.set(key, setup);
+        return wait('confirming', 'Setup found; waiting for fresh price confirmation', setup);
+      }
+      const changed = now > setup.lastAt && (spot !== setup.lastSpot || premium !== setup.lastPremium);
+      const previousSpot = setup.lastSpot;
+      if (changed) {
+        setup.updates++;
+        setup.lastAt = now;
+        setup.lastSpot = spot;
+        setup.lastPremium = premium;
+        if (spot < setup.peak - setup.buffer) {
+          if (!setup.pullback) setup.recoverySpot = setup.peak;
+          setup.pullback = true;
+        }
+        setup.peak = Math.max(setup.peak, spot);
+      }
+      if (setup.triggeredAt) {
+        if (spot < setup.entryLevel * direction || premium <= setup.initialPremium) {
+          return finish('invalidated', 'Entry confirmation lost; waiting for a new setup');
+        }
+        return { eligible: true, key: 'ready', detail: this.entryDescription(setup), metrics: timing.metrics, setup: { ...setup } };
+      }
+      if (setup.updates < options.confirmationUpdates || setup.lastAt - setup.startedAt < options.confirmationMs) {
+        return wait('confirming', `Confirming direction: ${setup.updates}/${options.confirmationUpdates} fresh updates; minimum ${options.confirmationMs / 1000}s`, setup);
+      }
+      const breakout = spot >= setup.triggerSpot * direction;
+      const recovery = setup.pullback && spot >= setup.recoverySpot && spot > previousSpot;
+      if (!changed || (!breakout && !recovery)) return wait('armed', 'Direction confirmed; waiting for a breakout or pullback recovery', setup);
+      if (premium <= setup.initialPremium) return wait('premium-unconfirmed', 'Spot trigger reached; waiting for selected option premium to strengthen', setup);
+      setup.triggeredAt = now;
+      setup.triggerType = recovery ? 'pullback recovery' : 'breakout';
+      setup.entryLevel = (recovery ? setup.recoverySpot : setup.triggerSpot * direction) * direction;
+      setup.expiresAt = Math.min(setup.expiresAt, now + options.entryLifetimeMs);
+      return { eligible: true, key: 'ready', detail: this.entryDescription(setup), metrics: timing.metrics, setup: { ...setup } };
+    }
+
+    entryDescription(setup) {
+      return `Confirmed ${setup.triggerType}; spot invalidation ${setup.invalidationSpot.toFixed(2)}; entry expires ${new Date(setup.expiresAt).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false })} IST`;
     }
 
     scoreSpotTrend(trend) {
@@ -823,6 +1111,11 @@
           if (spreadPct > 10) continue;
         }
         const warnings = ["delta", "iv", "theta", "gamma", "vega"].filter((key) => !Number.isFinite(quote[key])).map((key) => `${key} unavailable`);
+        if (state.sessionOpen !== undefined && (!Number.isFinite(spreadPct)
+          || spreadPct > this.entryOptions.maxSpreadPct
+          || !Number.isFinite(quote.quoteUpdatedAt)
+          || state.timestamp < quote.quoteUpdatedAt
+          || state.timestamp - quote.quoteUpdatedAt > this.entryOptions.quoteMaxAgeMs)) continue;
         if (!Number.isFinite(spreadPct)) warnings.push("Bid/ask spread unavailable");
         const thetaCostPct = Number.isFinite(quote.theta) ? Math.abs(quote.theta) / quote.ltp * 100 : NaN;
         const rank = Math.abs(row.strike - state.spotPrice) / step
@@ -837,7 +1130,9 @@
         };
         candidates.push({ ...quote, side, strike: row.strike, spreadPct, thetaCostPct, sensitivity, warnings, rank });
       }
-      return candidates.sort((a, b) => a.rank - b.rank || b.volume - a.volume)[0] || null;
+      const active = this.entrySetups.get(this.marketKey(state));
+      const locked = active?.side === side && !active.terminal ? candidates.find(item => item.strike === active.strike) : null;
+      return locked || candidates.sort((a, b) => a.rank - b.rank || b.volume - a.volume)[0] || null;
     }
 
     estimateStrikeStep(strikes) {

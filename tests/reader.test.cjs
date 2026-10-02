@@ -4,7 +4,15 @@ const vm = require('node:vm');
 const fs = require('node:fs');
 const path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname, '../content.js'), 'utf8');
-const context = vm.createContext({ OptionSignalEngine: class {}, URL });
+const context = vm.createContext({
+  OptionSignalEngine: class {},
+  OptionDepthScanner: class {
+    constructor() {}
+    stop() {}
+  },
+  document: {},
+  URL
+});
 vm.runInContext(source.slice(0, source.indexOf('  function getHistoryForMarket')) + '\nObject.assign(globalThis, { parseNumber, parseCellNumber, parsePercentage, normalizeNetworkSide, collectNetworkStrikes, mergeSide, parseOptionRow, normalizeExpiry }); })();', context);
 
 test('Indian units, unicode minus, decimals and missing values remain distinct', () => {

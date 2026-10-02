@@ -121,9 +121,10 @@ function createHarness({ stockName = "NIFTY", spot = 25000, centre = 25000,
           const defaults = typeof keys === "object" ? keys : {};
           callback({ ...defaults, ...stored });
         },
-        set(values) {
+        set(values, callback) {
           Object.assign(stored, values);
           if (values.latestSignalSnapshot) snapshots.push(values.latestSignalSnapshot);
+          callback?.();
         }
       } },
       runtime: { id: "test-extension", sendMessage(message, callback) {
@@ -133,10 +134,13 @@ function createHarness({ stockName = "NIFTY", spot = 25000, centre = 25000,
     }
   });
   vm.runInContext(engineSource, context, { filename: "OptionSignalEngine.js" });
-  vm.runInContext(contentSource, context, { filename: "content.js" });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../depthScanner.js'), 'utf8'), context);
+  vm.runInContext(contentSource.replace('  function recordSignalHistory(result) {',
+    '  globalThis.testRecordSignalHistory = recordSignalHistory;\n  function recordSignalHistory(result) {'), context, { filename: "content.js" });
 
   return {
     snapshots,
+    recordHistory: result => context.testRecordSignalHistory(result),
     setVisibility(hidden) {
       document.hidden = hidden;
       listeners.get("document:visibilitychange")?.();
@@ -153,6 +157,13 @@ function createHarness({ stockName = "NIFTY", spot = 25000, centre = 25000,
       return elementsById.get("upstox-quant-signal-overlay")?.roles.get(role)?.innerText;
     },
     mutateRow() { observer([{ target: leftRows[0], addedNodes: [] }]); },
+    quote(premium = 100) {
+      this.emitNetwork({ data: [centre - 50, centre, centre + 50].map(strike => ({
+        strike_price: strike, underlying_key: "NSE_INDEX|Nifty 50", expiry: "2026-09-24",
+        call_options: { market_data: { bid_price: premium - 1, ask_price: premium + 1 } },
+        put_options: { market_data: { bid_price: 99, ask_price: 101 } }
+      })) });
+    },
     emitNetwork(payload) {
       listeners.get("upstox-option-chain-network-payload")({ detail: {
         payload, timestamp: now, source: "network"
@@ -173,6 +184,17 @@ function createHarness({ stockName = "NIFTY", spot = 25000, centre = 25000,
       now = target;
     }
   };
+}
+
+function activateBullishSignal(app) {
+  app.quote();
+  app.setSpot(25001); app.advance(250);
+  for (let index = 0; index < 5; index++) {
+    app.advance(9750);
+    app.quote(100 + index);
+    app.setSpot(25002 + index * 4); app.advance(250);
+  }
+  assert.equal(app.latest.signalKey, "call", app.latest.signalDetail);
 }
 
 test("continuous updates run within 250ms instead of starving", () => {
@@ -216,7 +238,7 @@ test("initial data waits for a live change; fresh bullish data alerts", () => {
   const app = createHarness();
   assert.equal(app.notifications.length, 0);
   assert.match(app.latest.signalDetail, /live/);
-  app.setSpot(25001); app.advance(250);
+  activateBullishSignal(app);
   assert.equal(app.latest.signalLabel, "BUY CALL");
   assert.equal(app.latest.candidate.side, "call");
   assert.equal(app.notifications.length, 1);
@@ -229,17 +251,19 @@ test("initial data waits for a live change; fresh bullish data alerts", () => {
 });
 
 test("stale unchanged data suppresses repeat alerts", () => {
-  const app = createHarness(); app.setSpot(25001); app.advance(250);
+  const app = createHarness(); activateBullishSignal(app);
   app.advance(31000);
   assert.equal(app.latest.signalKey, "neutral");
   assert.match(app.latest.signalDetail, /unchanged/);
   app.advance(120000); assert.equal(app.notifications.length, 1);
 });
 
-test("fresh active signal repeats after two minutes", () => {
-  const app = createHarness(); app.setSpot(25001); app.advance(250);
-  for (let i = 0; i < 6; i++) { app.advance(19750); app.setSpot(25002 + i); app.advance(250); }
-  assert.equal(app.notifications.length, 2);
+test("an entry expires instead of repeating an old opportunity", () => {
+  const app = createHarness(); activateBullishSignal(app);
+  for (let i = 0; i < 4; i++) { app.advance(5000); app.quote(104); app.setSpot(25019 + i * 2); app.advance(250); }
+  assert.equal(app.latest.signalKey, "neutral");
+  assert.equal(app.latest.entryTiming.key, "expired");
+  assert.equal(app.notifications.length, 1);
 });
 
 test("selected spot beats unrelated tickers and total OI units are correct", () => {
@@ -281,4 +305,55 @@ test('matching network rows supplement the chain; other expiries are rejected', 
   assert.equal(app.latest.dataQuality.loadedRows, 4);
   app.advance(16000);
   assert.equal(app.latest.dataQuality.loadedRows, 3);
+});
+
+test('spot updates and DOM polling cannot refresh a captured contract quote', () => {
+  const app = createHarness();
+  app.quote();
+  app.setSpot(25001); app.advance(250);
+  const quoteTime = app.latest.candidate.quoteUpdatedAt;
+  app.advance(5000); app.setSpot(25002); app.advance(250);
+  assert.equal(app.latest.candidate.quoteUpdatedAt, quoteTime);
+  app.advance(5000); app.setSpot(25003); app.advance(250);
+  assert.equal(app.latest.signalKey, 'neutral');
+  assert.equal(app.latest.candidate, null);
+  assert.match(app.latest.signalDetail, /fresh bid\/ask/);
+});
+
+test('missing bid/ask data never produces a live BUY despite price movement', () => {
+  const app = createHarness();
+  for (let i = 0; i < 6; i++) {
+    app.advance(9750); app.setSpot(25001 + i * 4); app.advance(250);
+  }
+  assert.equal(app.notifications.length, 0);
+  assert.equal(app.latest.signalKey, 'neutral');
+  assert.match(app.latest.signalDetail, /fresh bid\/ask/);
+});
+
+test('experimental formula details are saved in snapshots and evaluation exports', () => {
+  const app = createHarness();
+  assert.equal(app.latest.research.version, 'recent-rr25-v1');
+  assert.equal(app.latest.research.mode, 'shadow');
+  assert.equal(app.latest.research.available, false);
+  assert.equal(app.evaluationLog[0].research.version, 'recent-rr25-v1');
+  assert.equal(app.notifications.length, 0);
+});
+
+test('history suppresses repeated same-contract signals and allows new entries after two minutes', () => {
+  const app = createHarness();
+  const signal = (time, patch = {}) => ({
+    marketState: { stockName: 'NIFTY', expiry: '2026-09-24', marketKey: 'NIFTY|2026-09-24', timestamp: time },
+    signal: { key: 'call', label: 'BUY CALL' }, forecast: {},
+    candidate: { strike: 25000, side: 'call', ltp: 100 }, ...patch
+  });
+  app.recordHistory(signal(100000));
+  for (let i = 1; i < 120; i++) app.recordHistory(signal(100000 + i * 1000));
+  assert.equal(app.signalHistory.length, 1);
+  assert.equal(app.signalHistory[0].signalTime, 100000);
+  app.recordHistory(signal(220000));
+  assert.equal(app.signalHistory.length, 2);
+  app.recordHistory(signal(221000, { signal: { key: 'put', label: 'BUY PUT' } }));
+  app.recordHistory(signal(222000, { candidate: { strike: 25050, side: 'call' } }));
+  app.recordHistory(signal(223000, { marketState: { stockName: 'NIFTY', marketKey: 'NIFTY|2026-10-01', expiry: '2026-10-01', timestamp: 223000 } }));
+  assert.equal(app.signalHistory.length, 5);
 });
