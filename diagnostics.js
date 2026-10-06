@@ -41,14 +41,7 @@
     }
     addCard(healthGrid, "Score", String(snapshot.totalScore ?? "--"));
     addCard(healthGrid, "Directional bias", snapshot.biasSignalLabel || "--");
-    addCard(healthGrid, "Entry timing", snapshot.entryTiming?.key || "--");
-    const setup = snapshot.entryTiming?.setup;
-    if (setup) {
-      addCard(healthGrid, "Spot trigger", number(setup.entryLevel ?? setup.triggerSpot));
-      addCard(healthGrid, "Spot invalidation", number(setup.invalidationSpot));
-      addCard(healthGrid, "Fresh price updates", String(setup.updates));
-      addCard(healthGrid, "Setup / entry expires", new Date(setup.expiresAt).toLocaleTimeString("en-IN"));
-    }
+    addCard(healthGrid, "Signal policy", snapshot.entryPolicy || "--");
     addCard(healthGrid, "Candidate spread", Number.isFinite(snapshot.candidate?.spreadPct) ? `${number(snapshot.candidate.spreadPct)}%` : "--");
     addCard(healthGrid, "Data quality", `${snapshot.dataQuality?.score ?? 0}/100`);
     addCard(healthGrid, "Loaded / valid rows", `${snapshot.dataQuality?.loadedRows ?? 0} / ${snapshot.dataQuality?.validRows ?? 0}`);
@@ -57,7 +50,7 @@
     for (const [name, value] of Object.entries(snapshot.factors || {})) {
       addCard(factorGrid, name.replace(/([A-Z])/g, " $1"), `${value > 0 ? "+" : ""}${number(value, 0)}`, value > 0 ? "positive" : value < 0 ? "negative" : "");
     }
-    currentIssues.textContent = [research?.reason ? `Experimental: ${research.reason}` : "", snapshot.entryTiming?.eligible === false ? snapshot.entryTiming.detail : "", ...(snapshot.blockers || []), ...(snapshot.dataQuality?.warnings || [])].filter(Boolean).join(" · ") || "No current blockers.";
+    currentIssues.textContent = [research?.reason ? `Experimental: ${research.reason}` : "", ...(snapshot.blockers || []), ...(snapshot.dataQuality?.warnings || [])].filter(Boolean).join(" · ") || "No current blockers.";
   }
 
   function outcomeCell(record, minutes) {

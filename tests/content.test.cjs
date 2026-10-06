@@ -192,11 +192,6 @@ function createHarness({ stockName = "NIFTY", spot = 25000, centre = 25000,
 function activateBullishSignal(app) {
   app.quote();
   app.setSpot(25001); app.advance(250);
-  for (let index = 0; index < 5; index++) {
-    app.advance(9750);
-    app.quote(100 + index);
-    app.setSpot(25002 + index * 4); app.advance(250);
-  }
   assert.equal(app.latest.signalKey, "call", app.latest.signalDetail);
 }
 
@@ -261,12 +256,11 @@ test("stale unchanged data suppresses repeat alerts", () => {
   app.advance(120000); assert.equal(app.notifications.length, 1);
 });
 
-test("an entry expires instead of repeating an old opportunity", () => {
+test("fresh directional signals persist beyond the former entry window", () => {
   const app = createHarness(); activateBullishSignal(app);
-  for (let i = 0; i < 4; i++) { app.advance(5000); app.quote(104); app.setSpot(25019 + i * 2); app.advance(250); }
-  assert.equal(app.latest.signalKey, "neutral");
-  assert.equal(app.latest.entryTiming.key, "expired");
-  assert.equal(app.notifications.length, 1);
+  for (let i = 0; i < 4; i++) { app.advance(10000); app.quote(104 + i); app.setSpot(25005 + i * 4); app.advance(250); }
+  assert.equal(app.latest.signalKey, "call", app.latest.signalDetail);
+  assert.equal(app.latest.entryPolicy, "directional-v1");
 });
 
 test("selected spot beats unrelated tickers and total OI units are correct", () => {
@@ -312,12 +306,9 @@ test('matching network rows supplement the chain; other expiries are rejected', 
 
 test('missing bid/ask data does not block a confirmed live BUY', () => {
   const app = createHarness();
-  for (let i = 0; i < 6; i++) {
-    app.advance(9750);
-    app.setCallLtp(101 + i);
-    app.setSpot(25001 + i * 4);
-    app.advance(250);
-  }
+  app.setCallLtp(101);
+  app.setSpot(25001);
+  app.advance(250);
   assert.equal(app.latest.signalKey, 'call');
   assert.equal(app.latest.candidate.side, 'call');
   assert.ok(Number.isNaN(app.latest.candidate.bidPrice));

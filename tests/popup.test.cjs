@@ -62,11 +62,11 @@ test('old warming snapshots are recognized; a ready zero forecast remains zero',
   assert.match(app.text('scoreDetail'), /Sideways/);
 });
 
-test('popup suppresses an expired entry even with fresh chain data', () => {
+test('popup keeps a fresh directional signal despite legacy entry expiry', () => {
   const app = harness({ ...buy, candidate: { quoteUpdatedAt: 100000 }, entryTiming: { eligible: true, setup: { expiresAt: 105000 } } });
   assert.equal(app.text('scoreSignal'), 'BUY CALL');
   app.advance(5000);
-  assert.match(app.text('scoreSignal'), /WAIT.*expired/);
+  assert.equal(app.text('scoreSignal'), 'BUY CALL');
 });
 
 test('popup does not block an entry because an optional quote is old', () => {

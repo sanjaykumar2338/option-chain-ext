@@ -60,28 +60,20 @@ function liveState(direction = "bullish", timestamp = 1000000, spotPrice = 25000
   return state;
 }
 
-test("live directional bias waits for timing history before alerting", () => {
-  const result = new OptionSignalEngine().analyze(liveState());
-  assert.equal(result.biasSignal.key, "call");
-  assert.equal(result.signal.key, "neutral");
-  assert.equal(result.entryTiming.key, "warming");
-  assert.match(result.signal.label, /BULLISH.*WAIT/);
-});
-
-test("entry timing rejects chasing and arms rather than buys a non-extended setup", () => {
-  const engine = new OptionSignalEngine();
-  const previous = liveState();
-  const chased = liveState("bullish", previous.timestamp + 31000, 25050);
-  const chasedResult = engine.analyze(chased, [previous]);
-  assert.equal(chasedResult.biasSignal.key, "call");
-  assert.equal(chasedResult.signal.key, "neutral");
-  assert.equal(chasedResult.entryTiming.key, "spot-extended");
-
-  const ready = liveState("bullish", previous.timestamp + 31000, 25005);
-  const readyResult = new OptionSignalEngine().analyze(ready, [previous]);
-  assert.equal(readyResult.signal.key, "neutral");
-  assert.equal(readyResult.entryTiming.key, "confirming");
-});
+for (const [direction, expected] of [["bullish", "call"], ["bearish", "put"]]) {
+  test(`live ${direction} signals immediately and persists without entry timing gates`, () => {
+    const engine = new OptionSignalEngine();
+    const previous = liveState(direction);
+    assert.equal(engine.analyze(previous).signal.key, expected);
+    const sign = direction === "bullish" ? 1 : -1;
+    for (const [seconds, move, premium] of [[31, 50, 130], [41, 5, 100], [57, 4, 99], [150, 10, 100]]) {
+      const result = engine.analyze(liveState(direction, previous.timestamp + seconds * 1000, 25000 + sign * move, premium), [previous]);
+      assert.equal(result.signal.key, expected);
+      assert.equal(result.entryPolicy, "directional-v1");
+      assert.equal(result.entryTiming, undefined);
+    }
+  });
+}
 
 test("signal boundaries remain at +50 and -50", () => {
   const engine = new OptionSignalEngine();
@@ -212,75 +204,6 @@ test("one-sided zero bid or ask does not block a contract recommendation", () =>
   }
 });
 
-function precisionScenario(direction = 'bullish') {
-  const engine = new OptionSignalEngine();
-  const prior = liveState(direction);
-  const sign = direction === 'bullish' ? 1 : -1;
-  const history = [prior];
-  const tick = (seconds, move, premium = 100, patch = {}) => {
-    const state = Object.assign(liveState(direction, prior.timestamp + seconds * 1000, 25000 + sign * move, premium), patch);
-    return engine.analyze(state, history);
-  };
-  return { engine, tick, prior };
-}
-
-for (const direction of ['bullish', 'bearish']) {
-  test(`${direction} needs elapsed confirmation, a spot trigger and a stronger option premium`, () => {
-    const { tick } = precisionScenario(direction);
-    assert.equal(tick(31, 5).entryTiming.key, 'confirming');
-    assert.equal(tick(32, 6, 101).entryTiming.key, 'confirming');
-    assert.equal(tick(33, 9, 102).entryTiming.key, 'confirming');
-    // Polling the same prices later must not finish confirmation.
-    assert.equal(tick(41, 9, 102).entryTiming.key, 'confirming');
-    const result = tick(42, 10, 103);
-    assert.equal(result.signal.key, direction === 'bullish' ? 'call' : 'put');
-    assert.equal(result.entryTiming.setup.triggerType, 'breakout');
-    assert.equal(result.entryTiming.setup.expiresAt, 1057000);
-    assert.equal(tick(57, 11, 104).entryTiming.key, 'expired');
-    assert.equal(tick(58, 12, 105).signal.key, 'neutral');
-  });
-}
-
-test('a breakout without premium confirmation waits', () => {
-  const { tick } = precisionScenario();
-  tick(31, 5); tick(36, 6);
-  const result = tick(41, 10);
-  assert.equal(result.signal.key, 'neutral');
-  assert.equal(result.entryTiming.key, 'premium-unconfirmed');
-});
-
-test('spot remaining inside the setup range does not produce an entry', () => {
-  const { tick } = precisionScenario();
-  tick(31, 5); tick(36, 6, 101);
-  assert.equal(tick(41, 7, 102).entryTiming.key, 'armed');
-});
-
-test('pullback recovery can trigger below the original breakout level', () => {
-  const { tick } = precisionScenario();
-  tick(31, 10); tick(36, 6, 101);
-  const result = tick(41, 10, 102);
-  assert.equal(result.signal.key, 'call');
-  assert.equal(result.entryTiming.setup.triggerType, 'pullback recovery');
-});
-
-test('invalidation cancels the setup and prevents immediate re-entry', () => {
-  const engine = new OptionSignalEngine();
-  const state = liveState();
-  const history = [liveState('bullish', state.timestamp - 31000)];
-  const candidate = engine.selectCandidate(state, 'call');
-  const timing = { eligible: true, metrics: {} };
-  engine.assessPrecisionEntry(state, history, 'call', candidate, timing, []);
-  const invalid = { ...state, timestamp: state.timestamp + 10000, spotPrice: 24997 };
-  assert.equal(engine.assessPrecisionEntry(invalid, history, 'call', candidate, timing, []).key, 'invalidated');
-  assert.equal(engine.assessPrecisionEntry({ ...state, timestamp: state.timestamp + 11000 }, history, 'call', candidate, timing, []).key, 'invalidated');
-});
-
-test('loss of premium confirmation cancels a ready entry', () => {
-  const { tick } = precisionScenario();
-  tick(31, 5); tick(36, 6, 101); tick(41, 10, 102);
-  assert.equal(tick(42, 11, 100).entryTiming.key, 'invalidated');
-});
-
 test('bid/ask availability and spread do not block an ITM candidate', () => {
   for (const patch of [
     { bidPrice: undefined }, { askPrice: undefined }, { bidPrice: 96, askPrice: 104 },
@@ -289,7 +212,7 @@ test('bid/ask availability and spread do not block an ITM candidate', () => {
     const state = liveState();
     state.strikes.forEach(row => Object.assign(row.call, patch));
     const result = new OptionSignalEngine().analyze(state);
-    assert.equal(result.signal.key, 'neutral');
+    assert.equal(result.signal.key, 'call');
     assert.ok(result.candidate);
     assert.doesNotMatch(result.signal.detail, /bid\/ask|spread/i);
   }
@@ -312,24 +235,4 @@ test('candidate selection uses only the first three ITM strikes', () => {
   assert.equal(engine.selectCandidate(state, 'put').strike, 25050);
   state.strikes.find(row => row.strike === 24800).call.volume = 999999999;
   assert.notEqual(engine.selectCandidate(state, 'call').strike, 24800);
-});
-
-test('switching expiry cannot reuse a pending setup', () => {
-  const { tick } = precisionScenario();
-  tick(31, 5); tick(36, 6, 101);
-  assert.equal(tick(41, 10, 102, { expiry: '2026-10-01' }).entryTiming.key, 'warming');
-  const result = tick(42, 11, 103);
-  assert.equal(result.entryTiming.key, 'confirming');
-  assert.equal(result.entryTiming.setup.updates, 1);
-});
-
-test('a pending setup expires without a trigger', () => {
-  const engine = new OptionSignalEngine();
-  const state = liveState();
-  const history = [liveState('bullish', state.timestamp - 31000)];
-  const candidate = engine.selectCandidate(state, 'call');
-  const timing = { eligible: true, metrics: {} };
-  engine.assessPrecisionEntry(state, history, 'call', candidate, timing, []);
-  const result = engine.assessPrecisionEntry({ ...state, timestamp: state.timestamp + 90000 }, history, 'call', candidate, timing, []);
-  assert.equal(result.key, 'expired');
 });
