@@ -1556,6 +1556,12 @@
 
   function scheduleFallbackDomCycle() {
     if (stopped) return;
+    // Hidden-tab timers may be delayed for a minute. MutationObserver already
+    // batches each DOM update, so consume background changes in this event turn.
+    if (document.hidden) {
+      runFallbackDomCycle();
+      return;
+    }
     // Do not postpone an already scheduled check on each incoming quote.
     if (fallbackTimer !== null) return;
     fallbackTimer = window.setTimeout(runFallbackDomCycle, FALLBACK_THROTTLE_MS);
@@ -1605,7 +1611,7 @@
   }
 
   function handleVisibilityChange() {
-    if (!document.hidden) scheduleFallbackDomCycle();
+    runFallbackDomCycle();
   }
 
   window.addEventListener(NETWORK_EVENT_NAME, handleNetworkPayload);

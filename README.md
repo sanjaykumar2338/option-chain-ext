@@ -55,3 +55,11 @@ Data schema reference: [Upstox option-chain response](https://upstox.com/develop
 - Exports contain both biases and their 5/10/15/20-minute underlying-direction outcomes when fresh observations arrive within 15 seconds of the horizon. These comparisons are not option-profit results or simulations of entry gates. Existing candidate return estimates are separate and exclude fees. Use later unseen sessions and executable quote/cost data before promoting the experiment to live alerts.
 
 Research context: [CME matched-delta risk reversals](https://www.cmegroup.com/education/courses/introduction-to-cvol/introduction-to-cvol-skew), [OIC limitations of open interest](https://www.optionseducation.org/referencelibrary/faq/general-information). Recent buildup is our proposed heuristic, not a published guarantee of predictive performance. Bid/ask quantity imbalance is deferred until captured quantity quality can be established.
+
+### Trading Charts header
+
+On `https://pro.upstox.com/trading-charts`, a compact header badge mirrors the latest option-chain signal: green for Call, red for Put, and gray for waiting/neutral. It includes the source symbol and expiry, plus the candidate strike for active entries. Hover for the signal explanation and last check time. Keep an option-chain tab open for live updates; the chart alone does not supply option-chain data. Signals revert to WAITING when their check or data timestamp is older than 30 seconds. When multiple option-chain tabs are open, the most recently published snapshot is shown, which may differ from the chart symbol.
+
+After updating the extension, reload it in `chrome://extensions` and refresh both the Trading Charts and option-chain tabs.
+
+Background tabs process incoming network events and option-chain DOM changes without waiting for throttled polling timers. The header receives storage updates directly and rechecks freshness on focus/visibility changes. Keep Chrome running and the logged-in option-chain tab open. Frozen/discarded tabs, computer sleep, or an Upstox feed that pauses in the background cannot supply live data; the header falls back to WAITING. Background behavior is covered by simulated paused-timer tests, but still needs verification with the live logged-in Upstox feed.

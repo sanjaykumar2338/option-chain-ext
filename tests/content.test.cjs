@@ -218,6 +218,7 @@ test("an invalidated extension context stops quietly after an extension reload",
 test("network updates are processed while the option-chain tab is inactive", () => {
   const app = createHarness();
   app.setVisibility(true);
+  const beforeNetwork = app.snapshots.length;
   app.emitNetwork({
     data: [{
       strike_price: 25100,
@@ -229,7 +230,7 @@ test("network updates are processed while the option-chain tab is inactive", () 
     }]
   });
   assert.equal(app.latest.dataQuality.loadedRows, 4);
-  assert.equal(app.snapshots.length, 2);
+  assert.equal(app.snapshots.length, beforeNetwork + 1);
 });
 
 test("initial data waits for a live change; fresh bullish data alerts", () => {
@@ -341,4 +342,28 @@ test('history suppresses repeated same-contract signals and allows new entries a
   app.recordHistory(signal(222000, { candidate: { strike: 25050, side: 'call' } }));
   app.recordHistory(signal(223000, { marketState: { stockName: 'NIFTY', marketKey: 'NIFTY|2026-10-01', expiry: '2026-10-01', timestamp: 223000 } }));
   assert.equal(app.signalHistory.length, 5);
+});
+
+ test("background DOM changes publish signals with all timers paused", () => {
+  const app = createHarness();
+  activateBullishSignal(app);
+  app.setVisibility(true);
+  const count = app.snapshots.length;
+  // Advance the clock without running any timeout or interval callbacks.
+  app.setTime(app.latest.updatedAt + 60000);
+  app.setSpot(25002);
+  assert.equal(app.snapshots.length, count + 1);
+  assert.equal(app.latest.spotPrice, 25002);
+  assert.equal(app.latest.updatedAt, app.latest.dataUpdatedAt);
+  assert.equal(app.warnings.length, 0);
+});
+
+ test("hiding a tab flushes a pending foreground DOM check", () => {
+  const app = createHarness();
+  const count = app.snapshots.length;
+  app.setSpot(25003);
+  assert.equal(app.snapshots.length, count);
+  app.setVisibility(true);
+  assert.equal(app.snapshots.length, count + 1);
+  assert.equal(app.latest.spotPrice, 25003);
 });

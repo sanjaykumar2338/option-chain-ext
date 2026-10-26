@@ -37,7 +37,8 @@
       ],
       "js": [
         "OptionSignalEngine.js",
-        "content.js"
+        "content.js",
+        "header-signal.js"
       ],
       "run_at": "document_idle"
     }
